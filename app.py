@@ -155,7 +155,7 @@ def card_row(df, section_key, title, subtitle="", show_cheese=False, show_remove
     for _, row in df.iterrows():
         with st.container():
             st.markdown('<div class="card textonly">', unsafe_allow_html=True)
-            st.markdown(f'<div class="name">🖼️ {row["name"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="name"> {row["name"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
             if show_cheese:
                 st.markdown(f'<div class="tagline">{cheesy(row["item_id"], row["name"], row["domain"])}</div>', unsafe_allow_html=True)
