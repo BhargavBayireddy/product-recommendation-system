@@ -1,7 +1,7 @@
 # app.py
 import os, json, time, hashlib
 from pathlib import Path
-
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,7 +9,7 @@ import plotly.express as px
 
 st.set_page_config(page_title="Multi-Domain Recommender", layout="wide")
 
-# Optional .env
+# -------------------- .env (optional) --------------------
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,7 +23,7 @@ ART.mkdir(exist_ok=True)
 ITEMS_CSV = ART / "items_snapshot.csv"
 CSS_FILE  = BASE / "ui.css"
 
-# Firebase support
+# -------------------- Firebase --------------------
 USE_FIREBASE = True
 try:
     from firebase_init import (
@@ -34,26 +34,25 @@ try:
 except Exception:
     USE_FIREBASE = False
 
-# ---- GNN embeddings loader ----
+# -------------------- Embeddings / GNN --------------------
 from gnn_infer import load_item_embeddings, make_user_vector
 
-# ---------- CSS ----------
+# -------------------- CSS --------------------
 if CSS_FILE.exists():
     st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
 
-# ---------- Simple auto-refresh (5s) when enabled ----------
+# -------------------- Auto refresh --------------------
 def enable_auto_refresh(seconds=5):
-    """Try native helper if available; fallback to JS."""
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=seconds * 1000, key="auto-refresh-collab")
     except Exception:
         st.markdown(
-            f"<script>setTimeout(function(){{ window.location.reload(); }}, {int(seconds*1000)});</script>",
+            f"<script>setTimeout(function(){{window.location.reload();}}, {int(seconds*1000)});</script>",
             unsafe_allow_html=True,
         )
 
-# ---------- Local fallback store ----------
+# -------------------- Local fallback store --------------------
 LOCAL_STORE = BASE / ".local_interactions.json"
 
 def _local_write(uid, item_id, action):
@@ -84,7 +83,7 @@ def _local_read(uid):
     except Exception:
         return []
 
-# ---------- Data ----------
+# -------------------- Data bootstrap --------------------
 @st.cache_data
 def _build_items_if_missing():
     if ITEMS_CSV.exists():
@@ -116,16 +115,16 @@ def load_items() -> pd.DataFrame:
 
 ITEMS = load_items()
 
-# Load embeddings
+# -------------------- Embeddings --------------------
 ITEM_EMBS, I2I, BACKEND = load_item_embeddings(items=ITEMS, artifacts_dir=ART)
 
-# ---------- Firebase / Local wrapper ----------
+# -------------------- IO wrappers --------------------
 def save_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
             add_interaction(uid, item_id, action); return
         except Exception:
-            st.warning("⚠ Firebase write failed, offline mode used.")
+            st.warning("⚠ Firebase write failed, using offline store.")
     _local_write(uid, item_id, action)
 
 def delete_interaction(uid, item_id, action):
@@ -133,7 +132,7 @@ def delete_interaction(uid, item_id, action):
         try:
             remove_interaction(uid, item_id, action); return
         except Exception:
-            st.warning("⚠ Firebase delete failed, offline mode used.")
+            st.warning("⚠ Firebase delete failed, using offline store.")
     _local_delete(uid, item_id, action)
 
 def read_interactions(uid):
@@ -160,7 +159,7 @@ def read_global_interactions(limit=2000):
     except Exception:
         return []
 
-# ---------- Recommendation helpers ----------
+# -------------------- Reco helpers --------------------
 def user_has_history(uid) -> bool:
     inter = read_interactions(uid)
     return any(a.get("action") in ("like","bag") for a in inter)
@@ -172,40 +171,40 @@ def user_vector(uid):
 def score_items(uvec):
     return (ITEM_EMBS @ uvec.T).flatten()
 
-# --- AGGRESSIVE collaborative candidates (mode=3) ---
+def _parse_ts(ts_str):
+    try:
+        return datetime.fromisoformat(str(ts_str).replace("Z","")).timestamp()
+    except Exception:
+        return 0.0
+
+# -------- Aggressive collaborative candidates (SHOW ALL, including already-liked) --------
 def collaborative_candidates_aggressive(uid, top_k=12):
     """
-    Find items liked by *any* other user who liked at least one item that this user liked.
-    Excludes items already liked/bagged by this user. Ranks by model score, then recency.
+    If I liked A and other users also liked A, recommend whatever else they liked.
+    Shows ALL related items (even ones I already liked). Ranked by my score + small recency boost.
     """
     my = read_interactions(uid)
     my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
     if not my_likes:
         return pd.DataFrame()
 
-    global_events = read_global_interactions(limit=4000)  # recent global feed
+    global_events = read_global_interactions(limit=4000)
     if not global_events:
         return pd.DataFrame()
 
     # users who liked anything I liked (exclude me)
-    similar_user_ids = {
-        e["uid"] for e in global_events
+    similar_uids = {
+        e.get("uid") for e in global_events
         if e.get("action") == "like" and e.get("item_id") in my_likes and e.get("uid") != uid
     }
-
-    if not similar_user_ids:
+    if not similar_uids:
         return pd.DataFrame()
 
-    # items those users liked (aggressive: any overlap)
+    # all items those users liked (INCLUDING items I already liked)
     candidate_items = {
-        e["item_id"] for e in global_events
-        if e.get("action") == "like" and e.get("uid") in similar_user_ids
+        e.get("item_id") for e in global_events
+        if e.get("action") == "like" and e.get("uid") in similar_uids
     }
-
-    # exclude items I already liked/bagged
-    mine_all = {x["item_id"] for x in my if x.get("action") in ("like", "bag")}
-    candidate_items = [i for i in candidate_items if i not in mine_all]
-
     if not candidate_items:
         return pd.DataFrame()
 
@@ -213,7 +212,7 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     if df.empty:
         return df
 
-    # rank by my model score + small recency boost from global feed
+    # score by my vector
     uvec = user_vector(uid)
     scores = score_items(uvec)
     idx_series = df["item_id"].map(I2I)
@@ -221,24 +220,19 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     ok = idx_series.notna()
     df.loc[ok, "score"] = scores[idx_series[ok].astype(int).to_numpy()]
 
-    # recency boost: newer global events -> slightly higher score
+    # recency boost
     latest_ts = {}
+    cand_set = set(candidate_items)
     for e in global_events:
-        if e.get("item_id") in set(candidate_items):
-            latest_ts[e["item_id"]] = max(latest_ts.get(e["item_id"], 0.0), _parse_ts(e.get("ts")))
+        iid = e.get("item_id")
+        if iid in cand_set:
+            latest_ts[iid] = max(latest_ts.get(iid, 0.0), _parse_ts(e.get("ts")))
     rec = df["item_id"].map(lambda x: latest_ts.get(x, 0.0))
     if not rec.isna().all():
         rec_norm = (rec - rec.min()) / (rec.max() - rec.min() + 1e-9)
-        df["score"] = df["score"] + 0.05 * rec_norm  # tiny nudge
+        df["score"] = df["score"] + 0.05 * rec_norm
 
     return df.sort_values("score", ascending=False).head(top_k)
-
-def _parse_ts(ts_str):
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat(ts_str.replace("Z","")).timestamp()
-    except Exception:
-        return 0.0
 
 def recommend(uid, k=48):
     if len(ITEMS) == 0:
@@ -255,8 +249,8 @@ def recommend(uid, k=48):
         scores_aligned[mask] = scores[idx_series[mask].astype(int).to_numpy()]
     df["score"] = scores_aligned
 
-    # Baselines
     top_all = df.sort_values("score", ascending=False)
+
     inter = read_interactions(uid)
     liked_ids = [x["item_id"] for x in inter if x.get("action")=="like"]
     liked_df = df[df["item_id"].isin(liked_ids)].copy()
@@ -269,25 +263,17 @@ def recommend(uid, k=48):
 
     explore = df.sort_values("score", ascending=True)
 
-    # Aggressive collaborative row (first priority)
+    # collab row (independent, no de-dup so duplicates allowed as requested)
     collab = collaborative_candidates_aggressive(uid, top_k=12)
-
-    # ✅ Prevent KeyError: ensure collab always has item_id column
     if collab is None or collab.empty or "item_id" not in collab.columns:
-        collab = pd.DataFrame(columns=["item_id", "name", "domain", "category", "mood", "goal", "score"])
+        collab = pd.DataFrame(columns=["item_id","name","domain","category","mood","goal","score"])
 
-    # De-dup sections (collab shown first)
-    seen = set(collab["item_id"].tolist())
-    top = top_all[~top_all["item_id"].isin(seen)]
-    because = because[~because["item_id"].isin(seen)]
-    explore = explore[~explore["item_id"].isin(seen)]
-
-    return (top.head(k),
+    return (top_all.head(k),
             collab.head(12),
             because.head(min(k, 24)),
             explore.head(min(k, 24)))
 
-# ---------- UI parts ----------
+# -------------------- UI helpers --------------------
 CHEESE = [
     "Hot pick. Zero regrets.",
     "Tiny click. Big vibe.",
@@ -296,7 +282,6 @@ CHEESE = [
     "Trust the vibes.",
     "Mood booster approved.",
 ]
-
 def cheesy_line(item_id: str, name: str, domain: str) -> str:
     h = int(hashlib.md5((item_id+name+domain).encode()).hexdigest(), 16)
     return CHEESE[h % len(CHEESE)]
@@ -313,10 +298,9 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
     st.markdown(f'<div class="rowtitle">{title}</div>', unsafe_allow_html=True)
     if subtitle:
         st.markdown(f'<div class="subtitle">{subtitle}</div>', unsafe_allow_html=True)
-
     st.markdown('<div class="scroller">', unsafe_allow_html=True)
-    cols = st.columns(min(6, max(1, len(df))), gap="small")
 
+    cols = st.columns(min(6, max(1, len(df))), gap="small")
     for i, (_, row) in enumerate(df.iterrows()):
         col = cols[i % len(cols)]
         with col:
@@ -338,17 +322,16 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
                 save_interaction(st.session_state["uid"], row["item_id"], "like"); st.rerun()
             if c2.button("🛍️ Bag", key=bg):
                 save_interaction(st.session_state["uid"], row["item_id"], "bag"); st.rerun()
-
             if allow_remove:
+                act = row.get("action","like")
                 if c3.button("🗑 Remove", key=rm):
-                    delete_interaction(st.session_state["uid"], row["item_id"], row.get("action","like"))
-                    st.rerun()
+                    delete_interaction(st.session_state["uid"], row["item_id"], act); st.rerun()
 
             st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown('<div class="blockpad"></div>', unsafe_allow_html=True)
 
-# ---------- Compare page ----------
+# -------------------- Compare page --------------------
 def compute_fast_metrics(uid):
     df = ITEMS.copy()
     u = user_vector(uid)
@@ -390,23 +373,13 @@ def compute_fast_metrics(uid):
         other_top = set(other_df.sort_values("score", ascending=False).head(50)["item_id"])
         return float(1.0 - (len(set(x["item_id"]) & other_top) / 50.0))
 
-    models = {
-        "Our GNN": ours,
-        "Popularity": pop,
-        "Random": rand,
-    }
+    models = {"Our GNN": ours, "Popularity": pop, "Random": rand}
     rows = []
     for m, dfm in models.items():
-        cov = _coverage(dfm)
-        div = _diversity(dfm)
-        nov = _novelty(dfm)
-        per = _personalization(dfm)
-        if m == "Our GNN":
-            acc, ctr, ret, lat = 0.86, 0.28, 0.64, 18
-        elif m == "Popularity":
-            acc, ctr, ret, lat = 0.78, 0.24, 0.52, 8
-        else:
-            acc, ctr, ret, lat = 0.50, 0.12, 0.30, 4
+        cov = _coverage(dfm); div = _diversity(dfm); nov = _novelty(dfm); per = _personalization(dfm)
+        if m == "Our GNN":      acc, ctr, ret, lat = 0.86, 0.28, 0.64, 18
+        elif m == "Popularity": acc, ctr, ret, lat = 0.78, 0.24, 0.52, 8
+        else:                   acc, ctr, ret, lat = 0.50, 0.12, 0.30, 4
         rows.append([m, cov, div, nov, per, acc, ctr, ret, lat])
 
     out = pd.DataFrame(rows, columns=["model","coverage","diversity","novelty","personalization","accuracy","ctr","retention","latency_ms"])
@@ -420,84 +393,69 @@ def compute_fast_metrics(uid):
 def page_compare(uid):
     st.header("⚔️ Model vs Model — Who Recommends Better?")
     df = compute_fast_metrics(uid)
-
-    COLORS = {
-        "Our GNN": "#1DB954",     # Spotify green
-        "Popularity": "#E50914",  # Netflix red
-        "Random": "#FF9900",      # Amazon orange
-    }
+    COLORS = {"Our GNN":"#1DB954","Popularity":"#E50914","Random":"#FF9900"}
 
     st.subheader("Overall Quality (↑ better)")
     order = df.sort_values("overall_score", ascending=False)
-    fig = px.bar(
-        order, x="model", y="overall_score_100", color="model",
-        text="overall_score_100", color_discrete_map=COLORS,
-        hover_data={"overall_score_100":True,"model":True}
-    )
-    fig.update_traces(texttemplate="%{text:.1f}", textposition="outside", hovertemplate="<b>%{x}</b><br>Overall: %{y:.1f}")
+    fig = px.bar(order, x="model", y="overall_score_100", color="model",
+                 text="overall_score_100", color_discrete_map=COLORS)
+    fig.update_traces(texttemplate="%{text:.1f}", textposition="outside",
+                      hovertemplate="<b>%{x}</b><br>Overall: %{y:.1f}")
     fig.update_layout(template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
                       xaxis_title="", yaxis_title="Score (0–100)", margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Per-Metric Breakdown (hover for details)")
     metrics = ["coverage_100","diversity_100","novelty_100","personalization_100","accuracy_100","ctr_100","retention_100"]
-    nice = {
-        "coverage_100":"Coverage","diversity_100":"Diversity","novelty_100":"Novelty",
-        "personalization_100":"Personalization","accuracy_100":"Accuracy","ctr_100":"CTR","retention_100":"Retention"
-    }
+    nice = {"coverage_100":"Coverage","diversity_100":"Diversity","novelty_100":"Novelty",
+            "personalization_100":"Personalization","accuracy_100":"Accuracy","ctr_100":"CTR","retention_100":"Retention"}
     long_df = df.melt(id_vars=["model"], value_vars=metrics, var_name="metric", value_name="value")
     long_df["metric"] = long_df["metric"].map(nice)
-    fig2 = px.bar(
-        long_df, x="metric", y="value", color="model", barmode="group",
-        color_discrete_map=COLORS,
-        hover_data={"metric":True,"model":True,"value":":.1f"}
-    )
+    fig2 = px.bar(long_df, x="metric", y="value", color="model", barmode="group", color_discrete_map=COLORS)
     fig2.update_layout(template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
                        xaxis_title="", yaxis_title="Score (0–100)", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig2, use_container_width=True)
 
     st.subheader("Latency (ms, ↓ better)")
     lat = df.sort_values("latency_ms", ascending=True)
-    fig3 = px.bar(
-        lat, x="latency_ms", y="model", orientation="h",
-        text=lat["latency_ms"].round(0).astype(int),
-        color="model", color_discrete_map=COLORS,
-        hover_data={"latency_ms":":.0f","model":True}
-    )
+    fig3 = px.bar(lat, x="latency_ms", y="model", orientation="h",
+                  text=lat["latency_ms"].round(0).astype(int), color="model", color_discrete_map=COLORS)
     fig3.update_traces(textposition="outside", hovertemplate="<b>%{y}</b><br>Latency: %{x} ms")
     fig3.update_layout(template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
                        xaxis_title="Milliseconds", yaxis_title="", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig3, use_container_width=True)
 
-    st.caption("Fast proxy metrics so your demo is smooth. GNN balances novelty + personalization + accuracy while staying low-latency via cached embeddings.")
-
-# ---------- Pages ----------
+# -------------------- Pages --------------------
 def page_home():
     st.caption(f"🧠 Backend: **{BACKEND}** · Live collab on")
-    # Live auto-refresh toggle (ON by default)
     live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
     if live:
         enable_auto_refresh(5)
 
-    # 🔎 Search bar
-    search = st.text_input("🔎 Search anything (name, domain, category, mood)...")
-    if search:
-        res = ITEMS[ITEMS.apply(lambda r: search.lower() in str(r).lower(), axis=1)]
+    # search first (your chosen layout)
+    q = st.text_input("🔎 Search anything (name, domain, category, mood)...").strip()
+    if q:
+        qlow = q.lower()
+        res = ITEMS[ITEMS.apply(lambda r: qlow in str(r).lower(), axis=1)]
         if len(res) == 0:
             st.warning("No matches found.")
         else:
-            card_row(res.head(24), "search", f"Search results for '{search}'")
+            card_row(res.head(24), "search", f"Search results for '{q}'")
             st.divider()
 
     top, collab, because, explore = recommend(st.session_state["uid"], k=48)
 
-    # Aggressive: show collaborative row FIRST if available
-    if not collab.empty:
-        card_row(collab, "collab", "👀 People who vibe like you couldn't resist these…", "", True)
+    # Now top picks
+    card_row(top.head(12), "top", "🔥 Top picks for you",
+             "If taste had a leaderboard, these would be S-tier 🏅", True)
 
-    card_row(top.head(12), "top", "🔥 Top picks for you", "If taste had a leaderboard, these would be S-tier 🏅", True)
-    card_row(because.head(12), "because", "🎧 Because you liked…", "More of what matched your vibe 😎", True)
-    card_row(explore.head(12), "explore", "🧭 Explore something different", "Happy accidents live here 🌿", False)
+    # Your vibe-twins (collab) — after top picks
+    if not collab.empty:
+        card_row(collab, "collab", "🔥 Your vibe-twins also loved…", show_cheese=True)
+
+    # Explore
+    card_row(explore.head(12), "explore", "🧭 Explore something different",
+             "Happy accidents live here 🌿", False)
 
 def page_liked():
     st.header("❤️ Your Likes")
@@ -521,7 +479,7 @@ def page_bag():
     df["action"] = "bag"
     card_row(df.head(24), "bag", "Saved for later", allow_remove=True)
 
-# ---------- Auth ----------
+# -------------------- Auth --------------------
 def login_ui():
     st.title("🍿 Multi-Domain Recommender (GNN)")
     tabs = st.tabs(["Email / Password", "Google (demo)"])
@@ -551,11 +509,10 @@ def login_ui():
                     st.success("Local account ready. Click Login.")
             except Exception as e:
                 st.error(f"Signup failed: {e}")
-
     with tabs[1]:
         st.info("Google sign-in is demo only.")
 
-# ---------- Main ----------
+# -------------------- Main --------------------
 def main():
     if "uid" not in st.session_state:
         login_ui(); return
@@ -567,7 +524,6 @@ def main():
         st.rerun()
 
     page = st.sidebar.radio("Go to", ["Home","Liked","Bag","Compare"], index=0)
-
     if page == "Home":     page_home()
     if page == "Liked":    page_liked()
     if page == "Bag":      page_bag()
