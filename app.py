@@ -1,376 +1,409 @@
+# app.py
 from __future__ import annotations
+
 import json
-from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Any
+from datetime import datetime
+import math
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import streamlit as st
+import plotly.graph_objects as go
 
-# Local modules (present in your repo)
-from firebase_init import (
-    signup_email_password,
-    login_email_password,
-    add_interaction,
-    remove_interaction,
-    fetch_user_interactions,
-    fetch_global_interactions,
-    ensure_user,
-)
+# ---- your firebase helpers (already in repo) ----
+# We only rely on functions/objects that exist in your current firebase_init.py
+import firebase_init as fb  # exposes: signup_email_password, login_email_password, add_interaction, remove_interaction, fetch_user_interactions, fetch_global_interactions, ensure_user, and _db (Firestore client)
 
-# Optional GNN helper
-try:
-    from gnn_infer import load_item_embeddings, make_user_vector
-    HAS_GNN = True
-except Exception:
-    HAS_GNN = False
+# ------------- Page config & simple theming ----------------
+st.set_page_config(page_title="Multi-Domain Recommender (GNN)", page_icon="🍿", layout="wide")
 
-
-# -------------------- Data --------------------
-@st.cache_data(show_spinner=False)
-def load_items() -> pd.DataFrame:
-    """
-    Expect your items CSV/loader to provide columns at least:
-        item_id, name, domain, provider, category, year, summary
-    If something is missing, we create safe defaults.
-    """
-    # Try your existing module first
-    try:
-        from data_real import load_items as _loader  # your existing function
-        df = _loader()
-    except Exception:
-        # Fallback tiny demo set (still works end-to-end)
-        df = pd.DataFrame(
-            [
-                # item_id, name, domain, provider, category, year, summary
-                ["m1", "Afternoon Acoustic", "Music", "Spotify", "Playlist", 2018, "Chill acoustic vibes."],
-                ["m2", "Bass Therapy", "Music", "Spotify", "Playlist", 2020, "Feel the floor shake."],
-                ["f1", "Evil Dead II", "Entertainment", "Netflix", "Movie", 1987, "Trust the vibes."],
-                ["f2", "Men in Black", "Entertainment", "Netflix", "Movie", 1997, "Tiny click. Big vibe."],
-                ["a1", "Echo Dot (5th Gen)", "Shopping", "Amazon", "Smart Speaker", 2023, "Small size, big sound."],
-                ["a2", "Kindle Paperwhite", "Shopping", "Amazon", "E-Reader", 2022, "Crisp display for books."],
-            ],
-            columns=["item_id", "name", "domain", "provider", "category", "year", "summary"],
-        )
-
-    # Safety: required columns + search blob
-    for col, default in [
-        ("item_id", ""),
-        ("name", ""),
-        ("domain", ""),
-        ("provider", ""),
-        ("category", ""),
-        ("year", ""),
-        ("summary", ""),
-    ]:
-        if col not in df.columns:
-            df[col] = default
-    # Search blob (lowercased)
-    df["search_blob"] = (
-        df["name"].fillna("").astype(str)
-        + " " + df["domain"].fillna("").astype(str)
-        + " " + df["provider"].fillna("").astype(str)
-        + " " + df["category"].fillna("").astype(str)
-        + " " + df["summary"].fillna("").astype(str)
-    ).str.lower()
-    return df
-
-
-ITEMS = load_items()
-ARTIFACTS_DIR = Path("artifacts")
-
-
-# -------------------- Brand colors & badges --------------------
-BRAND_BADGES = {
-    "Netflix": {"emoji": "🍿", "bg": "#FF3B30", "fg": "#FFFFFF"},   # red
-    "Amazon": {"emoji": "🛒", "bg": "#FF9900", "fg": "#000000"},   # orange
-    "Spotify": {"emoji": "🎧", "bg": "#1DB954", "fg": "#000000"},  # green
+BRAND_COLOR = {
+    "amazon": "#FF9900",  # orange
+    "netflix": "#E50914", # red
+    "spotify": "#1DB954", # green
 }
 
-def badge_capsule(label: str) -> str:
-    """Return HTML capsule for provider."""
-    p = BRAND_BADGES.get(label, None)
-    if not p:
-        # neutral capsule
-        return f"""<span style="
-            padding: 2px 10px; border-radius: 999px;
-            background:#E6E6E6; color:#111; font-size:12px;">{label}</span>"""
-    return f"""<span style="
-        padding: 2px 10px; border-radius: 999px;
-        background:{p['bg']}; color:{p['fg']}; font-size:12px;">{p['emoji']} {label}</span>"""
+BADGE_STYLE = "capsule"  # per your preference
+EMPTY_TILE = "#E9ECEF"
 
+# ---------------- Utilities -----------------
+def _norm_str(s: Any) -> str:
+    if s is None:
+        return ""
+    return str(s).strip().lower()
 
-# -------------------- Auth UI --------------------
-def ui_auth() -> str | None:
+def _platform_from_row(row: pd.Series) -> str:
+    # try domain/platform/provider tags
+    for k in ["platform", "provider", "domain", "source"]:
+        if k in row and isinstance(row[k], str):
+            val = row[k].lower()
+            if "amazon" in val: return "amazon"
+            if "netflix" in val: return "netflix"
+            if "spotify" in val: return "spotify"
+    # also look into tags if present
+    if "tags" in row and isinstance(row["tags"], (list, tuple)):
+        s = " ".join([str(x).lower() for x in row["tags"]])
+        if "amazon" in s: return "amazon"
+        if "netflix" in s: return "netflix"
+        if "spotify" in s: return "spotify"
+    return "other"
+
+def _brand_color_for_row(row: pd.Series) -> str:
+    plat = _platform_from_row(row)
+    return BRAND_COLOR.get(plat, EMPTY_TILE)
+
+def _pill(label: str) -> str:
+    if BADGE_STYLE == "capsule":
+        return f"""<span style="padding:2px 10px;border-radius:999px;background:#f5f5f5;border:1px solid #e7e7e7;margin-right:6px;font-size:12px;">{label}</span>"""
+    return f"""<span style="padding:2px 6px;border-radius:6px;background:#f5f5f5;border:1px solid #e7e7e7;margin-right:6px;font-size:12px;">{label}</span>"""
+
+def _search_blob(row: pd.Series) -> str:
+    fields = []
+    for k in ["name","title","brand","category","platform","provider","domain","description","summary"]:
+        if k in row and pd.notna(row[k]):
+            fields.append(str(row[k]))
+    # tags
+    if "tags" in row and isinstance(row["tags"], (list, tuple)):
+        fields += [str(t) for t in row["tags"]]
+    # year
+    if "year" in row and pd.notna(row["year"]):
+        fields.append(str(row["year"]))
+    return _norm_str(" ".join(fields))
+
+def safe_float(v, default=0.0):
+    try:
+        if v is None or (isinstance(v,float) and math.isnan(v)): return default
+        return float(v)
+    except Exception:
+        return default
+
+# ---------------- Data loading (ALL PRODUCTS) -----------------
+def load_all_items_from_firestore() -> pd.DataFrame:
+    """
+    Reads all collections that look like:
+      items_*, products_*, or a catchall 'items' / 'products'
+    Each doc should contain at least an 'id' or will get generated from doc.id
+    """
+    db = fb._db  # Firestore client initialized in firebase_init
+    possible = set()
+
+    # Try to enumerate known prefixes
+    for name in ["items", "products"]:
+        try:
+            possible.add(name)
+        except Exception:
+            pass
+
+    # Try known category collections commonly used in this project
+    for name in [
+        "items_music","items_movies","items_amazon","items_spotify","items_netflix",
+        "products_music","products_movies","products_general","items_general"
+    ]:
+        possible.add(name)
+
+    rows: List[Dict[str, Any]] = []
+    seen_cols = set()
+    for coll in sorted(possible):
+        try:
+            for doc in db.collection(coll).stream():
+                d = doc.to_dict() or {}
+                d = dict(d)
+                if "id" not in d:
+                    d["id"] = doc.id
+                d.setdefault("name", d.get("title", f"Item {doc.id[:6]}"))
+                # force tags list if stored as comma string
+                if isinstance(d.get("tags"), str):
+                    d["tags"] = [t.strip() for t in d["tags"].split(",") if t.strip()]
+                rows.append(d)
+                seen_cols.update(d.keys())
+        except Exception:
+            # collection might not exist; ignore
+            continue
+
+    if not rows:
+        # Fallback to empty df; the UI will handle it.
+        return pd.DataFrame(columns=["id","name","category","platform","domain","tags","price","rating","year"])
+
+    df = pd.DataFrame(rows)
+    # create normalized helper cols
+    if "category" not in df.columns: df["category"] = ""
+    if "platform" not in df.columns: df["platform"] = df.get("provider", df.get("domain",""))
+    if "rating" not in df.columns: df["rating"] = 0.0
+    if "price" not in df.columns: df["price"] = 0.0
+    if "year" not in df.columns: df["year"] = ""
+    if "tags" not in df.columns: df["tags"] = [[] for _ in range(len(df))]
+
+    # search blob
+    df["search_blob"] = df.apply(_search_blob, axis=1)
+    # brand color
+    df["tile_color"] = df.apply(_brand_color_for_row, axis=1)
+    return df
+
+# ---------------- Auth Gate -----------------
+def auth_gate() -> str | None:
     st.title("Sign in to continue")
+    email = st.text_input("Email", key="email")
+    pwd = st.text_input("Password", type="password", key="pwd")
 
-    email = st.text_input("Email", value=st.session_state.get("email", ""), key="email_input")
-    pw = st.text_input("Password", type="password", key="pw_input")
-
-    c1, c2 = st.columns([1, 1])
-    uid = st.session_state.get("uid")
-
-    def _finish_login(user):
-        st.session_state["uid"] = user["localId"]
-        st.session_state["email"] = email
-        ensure_user(st.session_state["uid"], email=email)
-        st.success("Logged in.")
-        st.rerun()
-
-    with c1:
+    col1, col2 = st.columns(2)
+    with col1:
         if st.button("Login", use_container_width=True):
             try:
-                user = login_email_password(email, pw)
-                _finish_login(user)
+                u = fb.login_email_password(email, pwd)
+                st.session_state["uid"] = u["localId"]
+                fb.ensure_user(u["localId"], email=email)
+                st.rerun()
             except Exception as e:
-                st.error(str(e))
-
-    with c2:
+                st.error("Invalid credentials. Please check email/password.")
+    with col2:
         if st.button("Create account", use_container_width=True):
             try:
-                user = signup_email_password(email, pw)
-                _finish_login(user)
-            except Exception as e:
-                st.error(str(e))
+                u = fb.signup_email_password(email, pwd)
+                st.session_state["uid"] = u["localId"]
+                fb.ensure_user(u["localId"], email=email)
+                st.rerun()
+            except Exception:
+                st.error("Could not create account. Try a different email or stronger password.")
+    return None
 
-    return uid
-
-
-# -------------------- Recommendation core (Mode C) --------------------
-def get_recommendations(uid: str, k: int = 24) -> Tuple[pd.DataFrame, str]:
+# ---------------- Cards & Grids -----------------
+def item_card(row: pd.Series, uid: str, i: int):
+    # colored tile + meta + buttons
+    tile = f"""
+    <div style="width:96px;height:64px;border-radius:14px;background:{row['tile_color']};"></div>
     """
-    Hybrid:
-      - If no likes: trending
-      - If few likes: blend 50/50
-      - If many likes: GNN full
-    """
-    interactions = fetch_user_interactions(uid)
-    likes = [x["item_id"] for x in interactions if x.get("action") == "like"]
-    backend_used = "Trending"
+    with st.container(border=True):
+        c1, c2 = st.columns([1,6], gap="large")
+        with c1:
+            st.markdown(tile, unsafe_allow_html=True)
+        with c2:
+            title = row.get("name") or row.get("title") or f"Item {row['id']}"
+            subtitle_bits = []
+            cat = row.get("category")
+            plat = row.get("platform") or row.get("domain")
+            yr = row.get("year")
+            if cat: subtitle_bits.append(cat)
+            if plat: subtitle_bits.append(plat)
+            if yr: subtitle_bits.append(str(yr))
+            st.markdown(f"**{title}**")
+            if subtitle_bits:
+                st.caption(" · ".join([str(x) for x in subtitle_bits]))
+            # pills
+            pills = []
+            for t in (row.get("tags") or []):
+                pills.append(_pill(str(t)))
+            if pills:
+                st.markdown("".join(pills), unsafe_allow_html=True)
 
-    # Trending from global (simple popularity)
-    global_feed = fetch_global_interactions(limit=5000)
-    pop = pd.Series([g["item_id"] for g in global_feed if g.get("action") == "like"]).value_counts()
-    trending = ITEMS.merge(pop.rename("pop"), left_on="item_id", right_index=True, how="left").fillna({"pop": 0.0})
-    trending = trending.sort_values("pop", ascending=False)
+        b1, b2, b3, b4 = st.columns([1,1,1,1])
+        item_id = row["id"]
 
-    if not HAS_GNN:
-        return trending.head(k), "Trending"
+        with b1:
+            if st.button("❤️ Like", key=f"like_{item_id}_{i}", use_container_width=True):
+                try:
+                    fb.add_interaction(uid, item_id, "like")
+                    st.success("Added to Likes")
+                    st.rerun()
+                except Exception:
+                    st.warning("Could not save like.")
+        with b2:
+            if st.button("👜 Bag", key=f"bag_{item_id}_{i}", use_container_width=True):
+                try:
+                    fb.add_interaction(uid, item_id, "bag")
+                    st.success("Added to Bag")
+                    st.rerun()
+                except Exception:
+                    st.warning("Could not add to bag.")
+        with b3:
+            if st.button("🗑 Remove", key=f"rm_{item_id}_{i}", use_container_width=True):
+                try:
+                    fb.remove_interaction(uid, item_id, "like")
+                    fb.remove_interaction(uid, item_id, "bag")
+                    st.info("Removed from Likes/Bag")
+                    st.rerun()
+                except Exception:
+                    st.warning("Could not remove.")
+        with b4:
+            if st.button("📊 Compare", key=f"cmp_{item_id}_{i}", use_container_width=True):
+                st.session_state.setdefault("compare_set", set()).add(item_id)
+                st.toast("Added to Compare")
+                st.rerun()
 
-    # Try GNN
-    item_embs, iid2idx, backend_label = load_item_embeddings(ITEMS, ARTIFACTS_DIR)
-    user_vec = make_user_vector(interactions, iid2idx, item_embs)  # [1,D]
-    # simple cosine scores
-    A = item_embs
-    denom = (np.linalg.norm(A, axis=1, keepdims=True) * np.linalg.norm(user_vec))
-    denom[denom == 0] = 1.0
-    scores = (A @ user_vec.T).squeeze() / denom.squeeze()
-    ITEMS_ = ITEMS.copy()
-    ITEMS_["gnn_score"] = scores
-
-    if len(likes) == 0:
-        # pure trending
-        backend_used = f"{backend_label} + Trending (cold start)"
-        out = trending
-    elif len(likes) < 3:
-        # blend
-        backend_used = f"{backend_label} × Trending (hybrid)"
-        # normalize both ranks
-        gnn_rank = ITEMS_[["item_id", "gnn_score"]].sort_values("gnn_score", ascending=False).reset_index(drop=True)
-        gnn_rank["gnn_rank"] = np.arange(len(gnn_rank))
-        tr_rank = trending[["item_id"]].reset_index(drop=True)
-        tr_rank["tr_rank"] = np.arange(len(tr_rank))
-        mix = ITEMS[["item_id"]].merge(gnn_rank[["item_id", "gnn_rank"]], on="item_id", how="left").merge(
-            tr_rank, on="item_id", how="left"
-        )
-        mix["gnn_rank"] = mix["gnn_rank"].fillna(len(mix))
-        mix["tr_rank"] = mix["tr_rank"].fillna(len(mix))
-        mix["mix_score"] = -0.5 * (len(mix) - mix["gnn_rank"]) + -0.5 * (len(mix) - mix["tr_rank"])
-        out = ITEMS.merge(mix[["item_id", "mix_score"]], on="item_id").sort_values("mix_score", ascending=False)
-    else:
-        backend_used = backend_label
-        out = ITEMS_.sort_values("gnn_score", ascending=False)
-
-    return out.head(k), backend_used
-
-
-# -------------------- Mood copy --------------------
-def mood_line(uid: str) -> str:
-    # simple cheerful copy based on local time + interactions
-    hour = pd.Timestamp.now().hour
-    interactions = fetch_user_interactions(uid)
-    n_likes = sum(1 for x in interactions if x.get("action") == "like")
-
-    if hour >= 23 or hour < 6:
-        base = "🦉 Midnight munchies? "
-    elif 6 <= hour < 12:
-        base = "☀️ Morning mojo? "
-    elif 12 <= hour < 18:
-        base = "💪 Afternoon grind? "
-    else:
-        base = "🌙 Cozy evening vibes? "
-
-    if n_likes == 0:
-        tail = "Let's find a new favorite in seconds."
-    elif n_likes < 5:
-        tail = "I’m learning your taste — keep the hearts coming."
-    else:
-        tail = "Your vibe is clear. I’ve dialed in the good stuff."
-    return base + tail
-
-
-# -------------------- UI helpers --------------------
-def item_card(row: pd.Series, uid: str):
-    # Header & sub-line
-    st.markdown(
-        f"**{row['name']}** ({int(row['year']) if str(row['year']).isdigit() else row['year']})",
-        help=row.get("summary", ""),
-    )
-
-    # Pills (domain + branded provider capsule)
-    pills = [
-        f"""<span style="padding:2px 10px;border-radius:999px;background:#F1F1F1;color:#111;font-size:12px;">{row['domain']}</span>""",
-        badge_capsule(str(row["provider"])),
-    ]
-    st.markdown(" ".join(pills), unsafe_allow_html=True)
-
-    # Actions
-    c1, c2, c3 = st.columns([0.18, 0.18, 0.18])
-    with c1:
-        if st.button("❤️ Like", key=f"like-{row['item_id']}"):
-            add_interaction(uid, row["item_id"], "like")
-            st.success("Added to Likes")
-            st.rerun()
-    with c2:
-        if st.button("🛍️ Bag", key=f"bag-{row['item_id']}"):
-            add_interaction(uid, row["item_id"], "bag")
-            st.success("Added to Bag")
-            st.rerun()
-    with c3:
-        if st.button("🗑️ Remove", key=f"rm-{row['item_id']}"):
-            # remove any of like/bag for this item for convenience
-            remove_interaction(uid, row["item_id"], "like")
-            remove_interaction(uid, row["item_id"], "bag")
-            st.info("Removed")
-            st.rerun()
-
-
-def render_grid(df: pd.DataFrame, uid: str, title: str):
-    st.subheader(title)
+def render_grid(df: pd.DataFrame, uid: str, heading: str):
+    st.subheader(heading)
     if df.empty:
-        st.info("No items to show yet.")
+        st.info("No items to show.")
         return
-    for _, r in df.iterrows():
-        with st.container(border=True):
-            item_card(r, uid)
+    for i, row in df.reset_index(drop=True).iterrows():
+        item_card(row, uid, i)
 
+# ---------------- Search -----------------
+def search_all(df: pd.DataFrame, q: str) -> pd.DataFrame:
+    qn = _norm_str(q)
+    if not qn:
+        return df
+    hits = df[df["search_blob"].str.contains(qn, na=False)]
+    return hits
 
-# -------------------- Pages --------------------
-def page_home(uid: str):
+# ---------------- Simple Collaborative "Top picks" -----------------
+def collab_recs(df: pd.DataFrame, uid: str, k: int = 12) -> pd.DataFrame:
+    """
+    Use interactions_global to find items others liked/bagged that you haven't.
+    """
+    try:
+        my_history = fb.fetch_user_interactions(uid, limit=1000)
+        my_ids = {h.get("item_id") for h in my_history}
+        global_hist = fb.fetch_global_interactions(limit=4000)
+        # count popularity
+        ctr = {}
+        for h in global_hist:
+            iid = h.get("item_id")
+            if not iid or iid in my_ids:
+                continue
+            ctr[iid] = ctr.get(iid, 0) + 1
+        if not ctr:
+            return df.sample(min(k, len(df)), random_state=42)
+        # join with df
+        tmp = df[df["id"].isin(ctr.keys())].copy()
+        tmp["score_pop"] = tmp["id"].map(ctr)
+        tmp = tmp.sort_values("score_pop", ascending=False)
+        return tmp.head(k)
+    except Exception:
+        # fallback: random
+        return df.sample(min(k, len(df)), random_state=0)
+
+# ---------------- Compare Page -----------------
+def compare_page(df: pd.DataFrame):
+    st.header("📊 Compare")
+    comp = list(st.session_state.get("compare_set", set()))
+    if len(comp) < 2:
+        st.info("Add at least two items using the **📊 Compare** button on a card.")
+        return
+    sub = df[df["id"].isin(comp)].copy()
+    if sub.empty:
+        st.info("Selected items are not in the current catalog.")
+        return
+
+    # Normalize numeric columns (use common ones if present)
+    num_cols = []
+    for candidate in ["rating","price","year","popularity","score"]:
+        if candidate in sub.columns and sub[candidate].notna().any():
+            num_cols.append(candidate)
+
+    # Sidebar remove
+    with st.expander("Currently comparing"):
+        for _, r in sub.iterrows():
+            colr = st.columns([6,1])
+            colr[0].markdown(f"- **{r.get('name', r['id'])}**")
+            if colr[1].button("✖", key=f"cmpdel_{r['id']}"):
+                st.session_state["compare_set"].discard(r["id"])
+                st.rerun()
+
+    # Table
+    show_cols = ["name","category","platform","rating","price","year","tags"]
+    show_cols = [c for c in show_cols if c in sub.columns]
+    st.dataframe(sub[show_cols].reset_index(drop=True), use_container_width=True)
+
+    # Bar chart (mathematical comparison)
+    if num_cols:
+        metric = st.selectbox("Metric", num_cols, index=0)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=sub["name"],
+            y=sub[metric].apply(lambda v: safe_float(v, 0.0)),
+        ))
+        fig.update_layout(
+            title=f"Comparison — {metric}",
+            xaxis_title="Item",
+            yaxis_title=metric.capitalize(),
+            height=420,
+            margin=dict(l=10,r=10,t=50,b=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Optional radar (uses up to 5 numeric metrics)
+    if len(num_cols) >= 3:
+        metrics = num_cols[:5]
+        categories = metrics + [metrics[0]]
+        radar = go.Figure()
+        for _, r in sub.iterrows():
+            vals = [safe_float(r.get(m,0.0),0.0) for m in metrics]
+            vals.append(vals[0])
+            radar.add_trace(go.Scatterpolar(r=vals, theta=categories, fill='toself', name=r.get("name", r["id"])))
+        radar.update_layout(polar=dict(radialaxis=dict(visible=True)), showlegend=True, height=500)
+        st.plotly_chart(radar, use_container_width=True)
+
+# ---------------- Main Pages -----------------
+def page_home(uid: str, df: pd.DataFrame):
     # Search bar
-    q = st.text_input("🔎 Search anything (name, domain, category, mood)...", placeholder="Type to search...")
-    if q:
-        qn = q.lower().strip()
-        hits = ITEMS[ITEMS["search_blob"].str.contains(qn, na=False)]
-        render_grid(hits.head(50), uid, "🍿 All matches")
+    q = st.text_input("🔎 Search anything (name, domain, category, tags)…", placeholder="Type to search...")
+    if _norm_str(q):
+        hits = search_all(df, q)
+        render_grid(hits, uid, "All matches")
         return
 
-    # Mood copy
-    st.caption(mood_line(uid))
+    # Top picks (collab)
+    picks = collab_recs(df, uid, k=12)
+    render_grid(picks, uid, "🔥 Top picks for you")
 
-    # Recommendations (mode C)
-    recs, backend_used = get_recommendations(uid, k=24)
-    st.caption(f"Backend: **{backend_used}**")
-    render_grid(recs, uid, "🔥 Top picks for you")
+    # Explore everything
+    render_grid(df, uid, "Explore all")
 
-
-def _filter_interactions(uid: str, action: str) -> pd.DataFrame:
-    inter = fetch_user_interactions(uid)
-    ids = [x["item_id"] for x in inter if x.get("action") == action]
-    if not ids:
-        return ITEMS.iloc[0:0]
-    return ITEMS[ITEMS["item_id"].isin(ids)]
-
-
-def page_liked(uid: str):
-    liked = _filter_interactions(uid, "like")
+def page_liked(uid: str, df: pd.DataFrame):
+    hist = fb.fetch_user_interactions(uid, limit=1000)
+    liked_ids = [h["item_id"] for h in hist if h.get("action") == "like"]
+    liked = df[df["id"].isin(liked_ids)]
     render_grid(liked, uid, "❤️ Your Likes")
 
+def page_bag(uid: str, df: pd.DataFrame):
+    hist = fb.fetch_user_interactions(uid, limit=1000)
+    bag_ids = [h["item_id"] for h in hist if h.get("action") == "bag"]
+    bag = df[df["id"].isin(bag_ids)]
+    render_grid(bag, uid, "👜 Your Bag")
 
-def page_bag(uid: str):
-    bag = _filter_interactions(uid, "bag")
-    render_grid(bag, uid, "🛍️ Your Bag")
-
-
-def page_compare(uid: str):
-    st.subheader("⚔️ Model vs Model — Who recommends better?")
-    st.caption("Left: Trending, Right: GNN (when available).")
-
-    left, right = st.columns(2)
-
-    # Left: Trending
-    global_feed = fetch_global_interactions(limit=5000)
-    pop = pd.Series([g["item_id"] for g in global_feed if g.get("action") == "like"]).value_counts()
-    tr = ITEMS.merge(pop.rename("pop"), left_on="item_id", right_index=True, how="left").fillna({"pop": 0.0})
-    tr = tr.sort_values("pop", ascending=False).head(12)
-
-    with left:
-        st.write("🏆 Trending")
-        for _, r in tr.iterrows():
-            with st.container(border=True):
-                item_card(r, uid)
-
-    # Right: GNN top
-    if HAS_GNN:
-        embs, idx, backend = load_item_embeddings(ITEMS, ARTIFACTS_DIR)
-        uv = make_user_vector(fetch_user_interactions(uid), idx, embs)
-        A = embs
-        denom = (np.linalg.norm(A, axis=1, keepdims=True) * np.linalg.norm(uv))
-        denom[denom == 0] = 1.0
-        s = (A @ uv.T).squeeze() / denom.squeeze()
-        df = ITEMS.copy()
-        df["score"] = s
-        df = df.sort_values("score", ascending=False).head(12)
-        with right:
-            st.write(f"🧠 {backend}")
-            for _, r in df.iterrows():
-                with st.container(border=True):
-                    item_card(r, uid)
-    else:
-        with right:
-            st.info("GNN not available in this build. Upload artifacts to enable.")
-
-
-# -------------------- Main --------------------
+# ---------------- App -----------------
 def main():
-    st.set_page_config(page_title="Multi-Domain Recommender (GNN)", page_icon="🍿", layout="wide")
-
-    # Gate: require login
     uid = st.session_state.get("uid")
     if not uid:
-        ui_auth()
-        return
+        return auth_gate()
 
     # Sidebar
     with st.sidebar:
-        st.success(f"Logged in:\n\n{st.session_state.get('email','')}")
-
+        st.success(f"Logged in:\n{st.session_state.get('email') or ''}")
+        st.markdown("---")
         page = st.radio("Go to", ["Home", "Liked", "Bag", "Compare"], index=0)
+        st.markdown("---")
         if st.button("Logout"):
-            for k in ["uid", "email"]:
-                st.session_state.pop(k, None)
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
             st.rerun()
+
+    # Load ALL items once per session
+    if "CATALOG" not in st.session_state:
+        try:
+            df = load_all_items_from_firestore()
+        except Exception:
+            df = pd.DataFrame(columns=["id","name","category","platform","tags","rating","price","year","search_blob","tile_color"])
+        st.session_state["CATALOG"] = df
+
+    df = st.session_state["CATALOG"]
+
+    # make sure id is string and unique
+    if not df.empty:
+        df["id"] = df["id"].astype(str)
+        df = df.drop_duplicates("id").reset_index(drop=True)
+        st.session_state["CATALOG"] = df
 
     # Routes
     if page == "Home":
-        page_home(uid)
+        page_home(uid, df)
     elif page == "Liked":
-        page_liked(uid)
+        page_liked(uid, df)
     elif page == "Bag":
-        page_bag(uid)
+        page_bag(uid, df)
     elif page == "Compare":
-        page_compare(uid)
-
+        compare_page(df)
 
 if __name__ == "__main__":
     main()
