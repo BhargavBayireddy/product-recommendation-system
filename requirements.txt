@@ -6,3 +6,5 @@ scikit-learn==1.5.2
 plotly==5.24.1
 torch==2.5.1
 torch-geometric
+pyrebase4
+firebase-admin
