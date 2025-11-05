@@ -45,7 +45,6 @@ if CSS_FILE.exists():
 def enable_auto_refresh(seconds=5):
     """Try native helper if available; fallback to JS."""
     try:
-        # optional dependency; if not installed, fallback to JS
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=seconds * 1000, key="auto-refresh-collab")
     except Exception:
@@ -197,7 +196,7 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     if not similar_user_ids:
         return pd.DataFrame()
 
-    # items those users liked (aggressive: no threshold other than any overlap)
+    # items those users liked (aggressive: any overlap)
     candidate_items = {
         e["item_id"] for e in global_events
         if e.get("action") == "like" and e.get("uid") in similar_user_ids
@@ -225,7 +224,7 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     # recency boost: newer global events -> slightly higher score
     latest_ts = {}
     for e in global_events:
-        if e.get("item_id") in candidate_items:
+        if e.get("item_id") in set(candidate_items):
             latest_ts[e["item_id"]] = max(latest_ts.get(e["item_id"], 0.0), _parse_ts(e.get("ts")))
     rec = df["item_id"].map(lambda x: latest_ts.get(x, 0.0))
     if not rec.isna().all():
@@ -236,7 +235,6 @@ def collaborative_candidates_aggressive(uid, top_k=12):
 
 def _parse_ts(ts_str):
     try:
-        # ISO string -> epoch seconds (rough)
         from datetime import datetime
         return datetime.fromisoformat(ts_str.replace("Z","")).timestamp()
     except Exception:
@@ -273,6 +271,10 @@ def recommend(uid, k=48):
 
     # Aggressive collaborative row (first priority)
     collab = collaborative_candidates_aggressive(uid, top_k=12)
+
+    # ✅ Prevent KeyError: ensure collab always has item_id column
+    if collab is None or collab.empty or "item_id" not in collab.columns:
+        collab = pd.DataFrame(columns=["item_id", "name", "domain", "category", "mood", "goal", "score"])
 
     # De-dup sections (collab shown first)
     seen = set(collab["item_id"].tolist())
@@ -472,7 +474,7 @@ def page_compare(uid):
 # ---------- Pages ----------
 def page_home():
     st.caption(f"🧠 Backend: **{BACKEND}** · Live collab on")
-    # Live auto-refresh toggle (default ON for aggressive mode)
+    # Live auto-refresh toggle (ON by default)
     live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
     if live:
         enable_auto_refresh(5)
