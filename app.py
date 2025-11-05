@@ -1,404 +1,376 @@
-# app.py
 from __future__ import annotations
 import json
 from pathlib import Path
 from typing import List, Dict, Tuple
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --- Local modules (must exist) ---
-# firebase_init provides: signup_email_password, login_email_password,
-# ensure_user, add_interaction, remove_interaction,
-# fetch_user_interactions, fetch_global_interactions
+# Local modules (present in your repo)
 from firebase_init import (
     signup_email_password,
     login_email_password,
-    ensure_user,
     add_interaction,
     remove_interaction,
     fetch_user_interactions,
     fetch_global_interactions,
+    ensure_user,
 )
 
-# GNN embeddings / inference (provided in your project)
-from gnn_infer import load_item_embeddings, make_user_vector
+# Optional GNN helper
+try:
+    from gnn_infer import load_item_embeddings, make_user_vector
+    HAS_GNN = True
+except Exception:
+    HAS_GNN = False
 
-# ------------------------------------------------------------
-# Data loading
-# ------------------------------------------------------------
-def load_items_catalog() -> pd.DataFrame:
+
+# -------------------- Data --------------------
+@st.cache_data(show_spinner=False)
+def load_items() -> pd.DataFrame:
     """
-    Replace this with your own loader (e.g., data_real.load_items()).
-    Must return a DataFrame with at least:
-    ['item_id','title','domain','platform'] and optional ['image','year','blurb','category','mood']
+    Expect your items CSV/loader to provide columns at least:
+        item_id, name, domain, provider, category, year, summary
+    If something is missing, we create safe defaults.
     """
-    # ---- TRY your real loader first ----
+    # Try your existing module first
     try:
-        # from data_real import load_items  # Uncomment if you have it
-        # return load_items()
-        raise ImportError()  # force demo if you have no loader line above
+        from data_real import load_items as _loader  # your existing function
+        df = _loader()
     except Exception:
-        # ---- Minimal demo fallback so app still runs ----
-        demo = [
-            # item_id, title, domain, platform, year, blurb
-            ("m1", "Afternoon Acoustic", "Music", "Spotify", 2018, "Tiny click. Big vibe."),
-            ("f1", "Four Rooms (1995)", "Entertainment", "Netflix", 1995, "Chef’s kiss material."),
-            ("f2", "Sabrina (1995)", "Entertainment", "Netflix", 1995, "Hot pick. Zero regrets."),
-            ("f3", "Restoration (1995)", "Entertainment", "Netflix", 1995, "Tiny click. Big vibe."),
-            ("f4", "Evita (1996)", "Entertainment", "Netflix", 1996, "Your next favorite."),
-            ("f5", "Evil Dead II (1987)", "Entertainment", "Netflix", 1987, "Trust the vibes."),
-            ("f6", "Men in Black (1997)", "Entertainment", "Netflix", 1997, "Iconic, obviously."),
-            ("p1", "Bass Therapy", "Music", "Spotify", 2020, "Feel the floor shake."),
-        ]
-        df = pd.DataFrame(demo, columns=["item_id","title","domain","platform","year","blurb"])
-        df["image"] = ""  # optional column
-        df["category"] = df["domain"]
-        df["mood"] = np.where(df["domain"].eq("Music"), "chill", "fun")
-        return df
+        # Fallback tiny demo set (still works end-to-end)
+        df = pd.DataFrame(
+            [
+                # item_id, name, domain, provider, category, year, summary
+                ["m1", "Afternoon Acoustic", "Music", "Spotify", "Playlist", 2018, "Chill acoustic vibes."],
+                ["m2", "Bass Therapy", "Music", "Spotify", "Playlist", 2020, "Feel the floor shake."],
+                ["f1", "Evil Dead II", "Entertainment", "Netflix", "Movie", 1987, "Trust the vibes."],
+                ["f2", "Men in Black", "Entertainment", "Netflix", "Movie", 1997, "Tiny click. Big vibe."],
+                ["a1", "Echo Dot (5th Gen)", "Shopping", "Amazon", "Smart Speaker", 2023, "Small size, big sound."],
+                ["a2", "Kindle Paperwhite", "Shopping", "Amazon", "E-Reader", 2022, "Crisp display for books."],
+            ],
+            columns=["item_id", "name", "domain", "provider", "category", "year", "summary"],
+        )
 
-ITEMS: pd.DataFrame = load_items_catalog()
-ITEMS["item_id"] = ITEMS["item_id"].astype(str)
-ITEM_ID_SET = set(ITEMS["item_id"].tolist())
+    # Safety: required columns + search blob
+    for col, default in [
+        ("item_id", ""),
+        ("name", ""),
+        ("domain", ""),
+        ("provider", ""),
+        ("category", ""),
+        ("year", ""),
+        ("summary", ""),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+    # Search blob (lowercased)
+    df["search_blob"] = (
+        df["name"].fillna("").astype(str)
+        + " " + df["domain"].fillna("").astype(str)
+        + " " + df["provider"].fillna("").astype(str)
+        + " " + df["category"].fillna("").astype(str)
+        + " " + df["summary"].fillna("").astype(str)
+    ).str.lower()
+    return df
 
+
+ITEMS = load_items()
 ARTIFACTS_DIR = Path("artifacts")
-ITEM_EMBS, IID2IDX, BACKEND_NAME = load_item_embeddings(ITEMS, ARTIFACTS_DIR)
 
-# ------------------------------------------------------------
-# Utility: fast lookups
-# ------------------------------------------------------------
-def df_by_ids(ids: List[str]) -> pd.DataFrame:
-    if not ids: 
-        return ITEMS.iloc[0:0]
-    return ITEMS.set_index("item_id").loc[[i for i in ids if i in ITEM_ID_SET]].reset_index()
 
-def tagline_for(row: pd.Series) -> str:
-    dom = str(row.get("domain",""))
-    plat = str(row.get("platform",""))
-    lines = {
-        "Music": [
-            "Hot pick. Zero regrets.",
-            "Chef’s playlist approves.",
-            "Eargasm alert.",
-            "Vibes? Delivered.",
-        ],
-        "Entertainment": [
-            "Chef’s kiss material.",
-            "You won’t text back.",
-            "Popcorn’s new bestie.",
-            "Binge. Regret nothing.",
-        ],
-        "Shopping": [
-            "Cart it like you mean it.",
-            "Your wallet is shaking.",
-            "Steal of the day. Literally (not).",
-            "Fits so good it flirts back.",
-        ]
-    }
-    bank = lines.get(dom, ["Certified fresh pick."])
-    msg = np.random.choice(bank)
-    if plat:
-        msg = f"{msg}"
-    return msg
+# -------------------- Brand colors & badges --------------------
+BRAND_BADGES = {
+    "Netflix": {"emoji": "🍿", "bg": "#FF3B30", "fg": "#FFFFFF"},   # red
+    "Amazon": {"emoji": "🛒", "bg": "#FF9900", "fg": "#000000"},   # orange
+    "Spotify": {"emoji": "🎧", "bg": "#1DB954", "fg": "#000000"},  # green
+}
 
-# ------------------------------------------------------------
-# Recommendation engines
-# ------------------------------------------------------------
-def user_recent_vectors(uid: str) -> np.ndarray:
-    try:
-        inter = fetch_user_interactions(uid, limit=500)
-    except Exception:
-        inter = []
-    return make_user_vector(inter, IID2IDX, ITEM_EMBS)
+def badge_capsule(label: str) -> str:
+    """Return HTML capsule for provider."""
+    p = BRAND_BADGES.get(label, None)
+    if not p:
+        # neutral capsule
+        return f"""<span style="
+            padding: 2px 10px; border-radius: 999px;
+            background:#E6E6E6; color:#111; font-size:12px;">{label}</span>"""
+    return f"""<span style="
+        padding: 2px 10px; border-radius: 999px;
+        background:{p['bg']}; color:{p['fg']}; font-size:12px;">{p['emoji']} {label}</span>"""
 
-def score_items_uservec(user_vec: np.ndarray) -> pd.DataFrame:
-    # cosine similarity
-    em = ITEM_EMBS / (np.linalg.norm(ITEM_EMBS, axis=1, keepdims=True) + 1e-8)
-    uv = user_vec / (np.linalg.norm(user_vec, axis=1, keepdims=True) + 1e-8)
-    sims = (em @ uv.T).ravel()
-    out = ITEMS.copy()
-    out["score"] = sims
-    return out.sort_values("score", ascending=False)
 
-def popular_from_global(k: int = 50) -> List[str]:
-    try:
-        g = fetch_global_interactions(limit=5000)
-    except Exception:
-        g = []
-    # simple popularity by likes + bag
-    weights = {"like": 2.0, "bag": 3.0}
-    pop: Dict[str, float] = {}
-    for e in g:
-        it = str(e.get("item_id",""))
-        act = str(e.get("action",""))
-        if it in ITEM_ID_SET:
-            pop[it] = pop.get(it, 0.0) + weights.get(act, 0.5)
-    if not pop:
-        return ITEMS.sample(min(k, len(ITEMS)), random_state=7)["item_id"].tolist()
-    ids = sorted(pop, key=lambda x: pop[x], reverse=True)
-    return ids[:k]
+# -------------------- Auth UI --------------------
+def ui_auth() -> str | None:
+    st.title("Sign in to continue")
 
-def recommend(uid: str, k: int = 48) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    email = st.text_input("Email", value=st.session_state.get("email", ""), key="email_input")
+    pw = st.text_input("Password", type="password", key="pw_input")
+
+    c1, c2 = st.columns([1, 1])
+    uid = st.session_state.get("uid")
+
+    def _finish_login(user):
+        st.session_state["uid"] = user["localId"]
+        st.session_state["email"] = email
+        ensure_user(st.session_state["uid"], email=email)
+        st.success("Logged in.")
+        st.rerun()
+
+    with c1:
+        if st.button("Login", use_container_width=True):
+            try:
+                user = login_email_password(email, pw)
+                _finish_login(user)
+            except Exception as e:
+                st.error(str(e))
+
+    with c2:
+        if st.button("Create account", use_container_width=True):
+            try:
+                user = signup_email_password(email, pw)
+                _finish_login(user)
+            except Exception as e:
+                st.error(str(e))
+
+    return uid
+
+
+# -------------------- Recommendation core (Mode C) --------------------
+def get_recommendations(uid: str, k: int = 24) -> Tuple[pd.DataFrame, str]:
     """
-    Returns (top_for_you, collab_because, explore_all)
-    - top_for_you: GNN/embedding ranked list
-    - collab_because: popularity/collab across users (not your own)
-    - explore_all: quick shuffle for discovery
+    Hybrid:
+      - If no likes: trending
+      - If few likes: blend 50/50
+      - If many likes: GNN full
     """
-    # per-user vector
-    u = user_recent_vectors(uid)
-    top = score_items_uservec(u).head(k)
+    interactions = fetch_user_interactions(uid)
+    likes = [x["item_id"] for x in interactions if x.get("action") == "like"]
+    backend_used = "Trending"
 
-    # collab via global interactions popularity
-    collab_ids = popular_from_global(k=k)
-    collab = df_by_ids(collab_ids)
+    # Trending from global (simple popularity)
+    global_feed = fetch_global_interactions(limit=5000)
+    pop = pd.Series([g["item_id"] for g in global_feed if g.get("action") == "like"]).value_counts()
+    trending = ITEMS.merge(pop.rename("pop"), left_on="item_id", right_index=True, how="left").fillna({"pop": 0.0})
+    trending = trending.sort_values("pop", ascending=False)
 
-    # explore (domain-balanced shuffle)
-    explore = ITEMS.sample(min(k, len(ITEMS)), random_state=42)
-    return top, collab, explore
+    if not HAS_GNN:
+        return trending.head(k), "Trending"
 
-# ------------------------------------------------------------
-# UI Helpers
-# ------------------------------------------------------------
-def pill(text: str) -> str:
-    return f'<span style="padding:2px 8px;border-radius:999px;background:#f1f3f5;font-size:12px;color:#333;border:1px solid #e6e6e6;">{text}</span>'
+    # Try GNN
+    item_embs, iid2idx, backend_label = load_item_embeddings(ITEMS, ARTIFACTS_DIR)
+    user_vec = make_user_vector(interactions, iid2idx, item_embs)  # [1,D]
+    # simple cosine scores
+    A = item_embs
+    denom = (np.linalg.norm(A, axis=1, keepdims=True) * np.linalg.norm(user_vec))
+    denom[denom == 0] = 1.0
+    scores = (A @ user_vec.T).squeeze() / denom.squeeze()
+    ITEMS_ = ITEMS.copy()
+    ITEMS_["gnn_score"] = scores
 
-def render_card(row: pd.Series, uid: str, section: str):
-    """
-    One item card with Like / Bag / Remove (with unique keys).
-    section is a short string: 'top' | 'collab' | 'explore' | 'liked' | 'bag'
-    """
-    item_id = str(row["item_id"])
-    title = str(row.get("title",""))
-    dom = str(row.get("domain",""))
-    plat = str(row.get("platform",""))
-    year = row.get("year", "")
-    blurb = str(row.get("blurb","").strip() or tagline_for(row))
-    img = str(row.get("image",""))
+    if len(likes) == 0:
+        # pure trending
+        backend_used = f"{backend_label} + Trending (cold start)"
+        out = trending
+    elif len(likes) < 3:
+        # blend
+        backend_used = f"{backend_label} × Trending (hybrid)"
+        # normalize both ranks
+        gnn_rank = ITEMS_[["item_id", "gnn_score"]].sort_values("gnn_score", ascending=False).reset_index(drop=True)
+        gnn_rank["gnn_rank"] = np.arange(len(gnn_rank))
+        tr_rank = trending[["item_id"]].reset_index(drop=True)
+        tr_rank["tr_rank"] = np.arange(len(tr_rank))
+        mix = ITEMS[["item_id"]].merge(gnn_rank[["item_id", "gnn_rank"]], on="item_id", how="left").merge(
+            tr_rank, on="item_id", how="left"
+        )
+        mix["gnn_rank"] = mix["gnn_rank"].fillna(len(mix))
+        mix["tr_rank"] = mix["tr_rank"].fillna(len(mix))
+        mix["mix_score"] = -0.5 * (len(mix) - mix["gnn_rank"]) + -0.5 * (len(mix) - mix["tr_rank"])
+        out = ITEMS.merge(mix[["item_id", "mix_score"]], on="item_id").sort_values("mix_score", ascending=False)
+    else:
+        backend_used = backend_label
+        out = ITEMS_.sort_values("gnn_score", ascending=False)
 
+    return out.head(k), backend_used
+
+
+# -------------------- Mood copy --------------------
+def mood_line(uid: str) -> str:
+    # simple cheerful copy based on local time + interactions
+    hour = pd.Timestamp.now().hour
+    interactions = fetch_user_interactions(uid)
+    n_likes = sum(1 for x in interactions if x.get("action") == "like")
+
+    if hour >= 23 or hour < 6:
+        base = "🦉 Midnight munchies? "
+    elif 6 <= hour < 12:
+        base = "☀️ Morning mojo? "
+    elif 12 <= hour < 18:
+        base = "💪 Afternoon grind? "
+    else:
+        base = "🌙 Cozy evening vibes? "
+
+    if n_likes == 0:
+        tail = "Let's find a new favorite in seconds."
+    elif n_likes < 5:
+        tail = "I’m learning your taste — keep the hearts coming."
+    else:
+        tail = "Your vibe is clear. I’ve dialed in the good stuff."
+    return base + tail
+
+
+# -------------------- UI helpers --------------------
+def item_card(row: pd.Series, uid: str):
+    # Header & sub-line
     st.markdown(
-        f"""
-        <div style="border-radius:16px;border:1px solid #eee;padding:14px;margin-bottom:10px;background:#fff;">
-          <div style="display:flex;gap:16px;align-items:center;">
-            <div style="width:80px;height:54px;background:#ff8a8a;border-radius:8px;"></div>
-            <div style="flex:1;">
-              <div style="font-weight:600">{title}{f" ({year})" if year else ""}</div>
-              <div style="opacity:.8;margin:4px 0 6px 0;">
-                {dom} · {plat} · {blurb}
-              </div>
-              <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                {pill(dom)} {pill(plat)}
-              </div>
-            </div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        f"**{row['name']}** ({int(row['year']) if str(row['year']).isdigit() else row['year']})",
+        help=row.get("summary", ""),
     )
 
-    cols = st.columns(3)
-    if cols[0].button("❤️ Like", key=f"{item_id}-{section}-like"):
-        try:
-            add_interaction(uid, item_id, "like")
+    # Pills (domain + branded provider capsule)
+    pills = [
+        f"""<span style="padding:2px 10px;border-radius:999px;background:#F1F1F1;color:#111;font-size:12px;">{row['domain']}</span>""",
+        badge_capsule(str(row["provider"])),
+    ]
+    st.markdown(" ".join(pills), unsafe_allow_html=True)
+
+    # Actions
+    c1, c2, c3 = st.columns([0.18, 0.18, 0.18])
+    with c1:
+        if st.button("❤️ Like", key=f"like-{row['item_id']}"):
+            add_interaction(uid, row["item_id"], "like")
             st.success("Added to Likes")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Failed: {e}")
-
-    if cols[1].button("👜 Bag", key=f"{item_id}-{section}-bag"):
-        try:
-            add_interaction(uid, item_id, "bag")
+            st.rerun()
+    with c2:
+        if st.button("🛍️ Bag", key=f"bag-{row['item_id']}"):
+            add_interaction(uid, row["item_id"], "bag")
             st.success("Added to Bag")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Failed: {e}")
-
-    if cols[2].button("🗑️ Remove", key=f"{item_id}-{section}-remove"):
-        # remove both like & bag entries for this item
-        try:
-            remove_interaction(uid, item_id, "like")
-            remove_interaction(uid, item_id, "bag")
+            st.rerun()
+    with c3:
+        if st.button("🗑️ Remove", key=f"rm-{row['item_id']}"):
+            # remove any of like/bag for this item for convenience
+            remove_interaction(uid, row["item_id"], "like")
+            remove_interaction(uid, row["item_id"], "bag")
             st.info("Removed")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error(f"Failed: {e}")
+            st.rerun()
 
-def render_grid(df: pd.DataFrame, uid: str, header: str, section: str):
-    st.subheader(header)
-    # 5-column responsive grid with unique keys per item
-    for _, row in df.iterrows():
-        render_card(row, uid, section)
 
-def list_user_bucket(uid: str, action: str) -> pd.DataFrame:
-    try:
-        hist = fetch_user_interactions(uid, limit=1000)
-    except Exception:
-        hist = []
-    ids = [h["item_id"] for h in hist if h.get("action")==action]
-    # ensure uniqueness, keep order by most recent
-    ids = list(dict.fromkeys(ids))
-    return df_by_ids(ids)
+def render_grid(df: pd.DataFrame, uid: str, title: str):
+    st.subheader(title)
+    if df.empty:
+        st.info("No items to show yet.")
+        return
+    for _, r in df.iterrows():
+        with st.container(border=True):
+            item_card(r, uid)
 
-# ------------------------------------------------------------
-# Auth UI
-# ------------------------------------------------------------
-def auth_gate() -> str | None:
-    st.title("Sign in to continue")
-    email = st.text_input("Email", value=st.session_state.get("last_email",""))
-    pw = st.text_input("Password", type="password")
-    c1, c2 = st.columns(2)
 
-    # (Login)
-    if c1.button("Login", use_container_width=True):
-        try:
-            u = login_email_password(email, pw)
-            st.session_state["uid"] = u["localId"]
-            st.session_state["last_email"] = email
-            ensure_user(u["localId"], email=email)
-            st.success("Logged in")
-            st.experimental_rerun()
-        except Exception as e:
-            st.error("Invalid email or password. Try again or create an account.")
-
-    # (Signup)
-    if c2.button("Create account", use_container_width=True):
-        if len(pw) < 6:
-            st.error("Password must be at least 6 characters.")
-        else:
-            try:
-                u = signup_email_password(email, pw)
-                st.session_state["uid"] = u["localId"]
-                st.session_state["last_email"] = email
-                ensure_user(u["localId"], email=email)
-                st.success("Account created. Welcome!")
-                st.experimental_rerun()
-            except Exception:
-                st.error("Could not create account. Try a different email or stronger password.")
-    return None
-
-# ------------------------------------------------------------
-# Pages
-# ------------------------------------------------------------
+# -------------------- Pages --------------------
 def page_home(uid: str):
-    st.caption(f"🧠 Backend: {BACKEND_NAME} · domain-colored tiles (no images) for speed")
-
-    # Netflix-style instant search (shows ALL items while typing)
+    # Search bar
     q = st.text_input("🔎 Search anything (name, domain, category, mood)...", placeholder="Type to search...")
-    qn = q.strip().lower()
-
-    if qn:
-        # contains match across several fields
-        mask = (
-            ITEMS["title"].str.lower().str.contains(qn, na=False) |
-            ITEMS["domain"].str.lower().str.contains(qn, na=False) |
-            ITEMS["platform"].str.lower().str.contains(qn, na=False) |
-            ITEMS.get("category", pd.Series([""]*len(ITEMS))).astype(str).str.lower().str.contains(qn, na=False) |
-            ITEMS.get("mood", pd.Series([""]*len(ITEMS))).astype(str).str.lower().str.contains(qn, na=False)
-        )
-        results = ITEMS[mask].copy()
-        st.markdown("### 🍿 All matches")
-        if results.empty:
-            st.info("Nothing yet. Try a different word.")
-        else:
-            for _, r in results.iterrows():
-                render_card(r, uid, "search")
+    if q:
+        qn = q.lower().strip()
+        hits = ITEMS[ITEMS["search_blob"].str.contains(qn, na=False)]
+        render_grid(hits.head(50), uid, "🍿 All matches")
         return
 
-    # Otherwise: recommendations first (aggressive + cheesy copy)
-    top, collab, explore = recommend(uid, k=48)
+    # Mood copy
+    st.caption(mood_line(uid))
 
-    st.markdown("## 🔥 Top picks for you")
-    st.caption("If taste had a leaderboard, these would be S-tier 🥇")
-    for _, r in top.iterrows():
-        render_card(r, uid, "top")
+    # Recommendations (mode C)
+    recs, backend_used = get_recommendations(uid, k=24)
+    st.caption(f"Backend: **{backend_used}**")
+    render_grid(recs, uid, "🔥 Top picks for you")
 
-    st.markdown("## 💞 Vibe-twins also loved…")
-    st.caption("People who liked your faves are going feral for these 😏")
-    for _, r in collab.iterrows():
-        render_card(r, uid, "collab")
 
-    st.markdown("## 🧪 Explore something different")
-    st.caption("Swipe right on a new mood — we won’t tell.")
-    for _, r in explore.iterrows():
-        render_card(r, uid, "explore")
+def _filter_interactions(uid: str, action: str) -> pd.DataFrame:
+    inter = fetch_user_interactions(uid)
+    ids = [x["item_id"] for x in inter if x.get("action") == action]
+    if not ids:
+        return ITEMS.iloc[0:0]
+    return ITEMS[ITEMS["item_id"].isin(ids)]
+
 
 def page_liked(uid: str):
-    st.header("❤️ Your Likes")
-    liked = list_user_bucket(uid, "like")
-    if liked.empty:
-        st.info("You haven’t liked anything yet.")
-        return
-    for _, r in liked.iterrows():
-        render_card(r, uid, "liked")
+    liked = _filter_interactions(uid, "like")
+    render_grid(liked, uid, "❤️ Your Likes")
+
 
 def page_bag(uid: str):
-    st.header("👜 Your Bag")
-    bag = list_user_bucket(uid, "bag")
-    if bag.empty:
-        st.info("Your bag is empty.")
-        return
-    for _, r in bag.iterrows():
-        render_card(r, uid, "bag")
+    bag = _filter_interactions(uid, "bag")
+    render_grid(bag, uid, "🛍️ Your Bag")
 
-def page_compare(uid: str, k: int = 20):
-    """
-    Side-by-side model output:
-    - Left: GNN (or RandomFallback) personalized ranking
-    - Right: Collaborative/Popular (global)
-    """
-    st.header("⚔️ Model vs Model — Who recommends better?")
-    st.caption("Left: **GNN** personalized ranking. Right: **Popular/Collaborative** across users.")
 
-    # left: GNN
-    u = user_recent_vectors(uid)
-    left = score_items_uservec(u).head(k)
+def page_compare(uid: str):
+    st.subheader("⚔️ Model vs Model — Who recommends better?")
+    st.caption("Left: Trending, Right: GNN (when available).")
 
-    # right: popularity/collab
-    right_ids = popular_from_global(k=k)
-    right = df_by_ids(right_ids)
+    left, right = st.columns(2)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader(f"🔮 {BACKEND_NAME} top {k}")
-        for _, r in left.iterrows():
-            render_card(r, uid, "cmp-left")
-    with c2:
-        st.subheader(f"⭐ Collab/Popular top {k}")
-        for _, r in right.iterrows():
-            render_card(r, uid, "cmp-right")
+    # Left: Trending
+    global_feed = fetch_global_interactions(limit=5000)
+    pop = pd.Series([g["item_id"] for g in global_feed if g.get("action") == "like"]).value_counts()
+    tr = ITEMS.merge(pop.rename("pop"), left_on="item_id", right_index=True, how="left").fillna({"pop": 0.0})
+    tr = tr.sort_values("pop", ascending=False).head(12)
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
+    with left:
+        st.write("🏆 Trending")
+        for _, r in tr.iterrows():
+            with st.container(border=True):
+                item_card(r, uid)
+
+    # Right: GNN top
+    if HAS_GNN:
+        embs, idx, backend = load_item_embeddings(ITEMS, ARTIFACTS_DIR)
+        uv = make_user_vector(fetch_user_interactions(uid), idx, embs)
+        A = embs
+        denom = (np.linalg.norm(A, axis=1, keepdims=True) * np.linalg.norm(uv))
+        denom[denom == 0] = 1.0
+        s = (A @ uv.T).squeeze() / denom.squeeze()
+        df = ITEMS.copy()
+        df["score"] = s
+        df = df.sort_values("score", ascending=False).head(12)
+        with right:
+            st.write(f"🧠 {backend}")
+            for _, r in df.iterrows():
+                with st.container(border=True):
+                    item_card(r, uid)
+    else:
+        with right:
+            st.info("GNN not available in this build. Upload artifacts to enable.")
+
+
+# -------------------- Main --------------------
 def main():
     st.set_page_config(page_title="Multi-Domain Recommender (GNN)", page_icon="🍿", layout="wide")
 
-    # Guard: authenticated?
+    # Gate: require login
     uid = st.session_state.get("uid")
     if not uid:
-        return auth_gate()
+        ui_auth()
+        return
 
     # Sidebar
     with st.sidebar:
-        st.success(f"Logged in: {st.session_state.get('last_email','')}")
+        st.success(f"Logged in:\n\n{st.session_state.get('email','')}")
+
+        page = st.radio("Go to", ["Home", "Liked", "Bag", "Compare"], index=0)
         if st.button("Logout"):
-            for k in ["uid"]:
+            for k in ["uid", "email"]:
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            st.rerun()
 
-        page = st.radio("Go to", ["Home","Liked","Bag","Compare"], index=0)
-
-    # Router
+    # Routes
     if page == "Home":
         page_home(uid)
     elif page == "Liked":
         page_liked(uid)
     elif page == "Bag":
         page_bag(uid)
-    else:
+    elif page == "Compare":
         page_compare(uid)
+
 
 if __name__ == "__main__":
     main()
