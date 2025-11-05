@@ -1,100 +1,153 @@
 # firebase_init.py
 from __future__ import annotations
-from typing import Any, Dict, List
+import json
+from pathlib import Path
+from typing import Dict, Any, List
 from datetime import datetime, timezone
 
+# Third-party
 import streamlit as st
+
+# These imports must exist in requirements.txt:
+# pyrebase4
+# firebase-admin
 import pyrebase
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+# ---- File fallbacks (for local dev) ----
+BASE = Path(__file__).parent
+FOLDER = BASE / "firebase"
+WEB_JSON = FOLDER / "firebaseConfig.json"
+SA_JSON  = FOLDER / "serviceAccount.json"
 
 USERS_COLL = "users"
 USER_INTERACTIONS_SUB = "interactions"
 GLOBAL_INTERACTIONS = "interactions_global"
 
-# ---------- Init from Streamlit Secrets ----------
-def _get_web_config() -> Dict[str, Any]:
-    cfg = st.secrets["FIREBASE_WEB_CONFIG"]
-    # pyrebase needs databaseURL even if unused
-    if "databaseURL" not in cfg:
-        pid = cfg.get("projectId", "")
-        cfg["databaseURL"] = f"https://{pid}.firebaseio.com"
+def _load_web_cfg() -> Dict[str, Any]:
+    """Load Firebase Web SDK config from Streamlit secrets or local file."""
+    cfg = None
+    if "FIREBASE_WEB_CONFIG" in st.secrets:
+        raw = st.secrets["FIREBASE_WEB_CONFIG"]
+        cfg = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    elif WEB_JSON.exists():
+        cfg = json.loads(WEB_JSON.read_text(encoding="utf-8"))
+
+    if not cfg:
+        raise RuntimeError(
+            "FIREBASE_WEB_CONFIG missing. Add it in Streamlit → Settings → Secrets."
+        )
+
+    # pyrebase expects databaseURL to exist, even if unused
+    if "databaseURL" not in cfg or not cfg["databaseURL"]:
+        project_id = cfg.get("projectId", "")
+        cfg["databaseURL"] = f"https://{project_id}.firebaseio.com"
     return cfg
 
-def _get_admin_cred() -> credentials.Certificate:
-    # The service account object is stored as JSON in secrets
-    svc = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
-    return credentials.Certificate(dict(svc))
+def _load_service_account() -> Dict[str, Any]:
+    """Load Firebase Admin service account from Streamlit secrets or local file."""
+    sa = None
+    if "FIREBASE_SERVICE_ACCOUNT" in st.secrets:
+        raw = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
+        sa = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    elif SA_JSON.exists():
+        sa = json.loads(SA_JSON.read_text(encoding="utf-8"))
 
-@st.cache_resource(show_spinner=False)
-def get_clients():
-    """Create singleton pyrebase (client) and admin Firestore clients."""
-    web_cfg = _get_web_config()
-    fb_client = pyrebase.initialize_app(web_cfg)
-    auth = fb_client.auth()
+    if not sa:
+        raise RuntimeError(
+            "FIREBASE_SERVICE_ACCOUNT missing. Add it in Streamlit → Settings → Secrets."
+        )
+    return sa
 
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(_get_admin_cred())
-    db = firestore.client()
-    return auth, db
+# ---- Initialize SDKs (singletons) ----
+_web_cfg = _load_web_cfg()
+_sa_dict = _load_service_account()
 
-# ---------- Helpers ----------
-def ensure_user(db, uid: str, email: str | None = None) -> None:
-    doc_ref = db.collection(USERS_COLL).document(uid)
-    if not doc_ref.get().exists:
-        doc_ref.set({
-            "uid": uid,
-            "email": email or "",
-            "created_at": datetime.now(timezone.utc).isoformat()
-        })
+_fb_app_client = pyrebase.initialize_app(_web_cfg)
+_auth = _fb_app_client.auth()
 
+if not firebase_admin._apps:
+    cred = credentials.Certificate(_sa_dict)
+    firebase_admin.initialize_app(cred)
+_db = firestore.client()
+
+# ---------------- Core helpers ----------------
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def ensure_user(uid: str, email: str | None = None) -> None:
+    """Create users/{uid} if it doesn't exist."""
+    doc = _db.collection(USERS_COLL).document(uid)
+    snap = doc.get()
+    if not snap.exists:
+        doc.set({"uid": uid, "email": email or "", "created_at": _now_iso()})
+
+# --------------- Auth (pyrebase client) ---------------
 def signup_email_password(email: str, password: str) -> Dict[str, Any]:
-    auth, db = get_clients()
-    user = auth.create_user_with_email_and_password(email, password)
-    ensure_user(db, user["localId"], email=email)
-    return user
+    """
+    Creates a Firebase Auth user (client API).
+    Returns pyrebase's user dict (includes localId, idToken).
+    Raises RuntimeError with a readable message.
+    """
+    try:
+        user = _auth.create_user_with_email_and_password(email, password)
+        ensure_user(user["localId"], email=email)
+        return user
+    except Exception as e:
+        # Decode common Firebase errors
+        msg = str(e)
+        if "EMAIL_EXISTS" in msg:
+            raise RuntimeError("That email is already registered. Try logging in.")
+        if "WEAK_PASSWORD" in msg or "Password should be at least" in msg:
+            raise RuntimeError("Password too weak (min 6 characters).")
+        if "INVALID_EMAIL" in msg:
+            raise RuntimeError("That email looks invalid.")
+        raise RuntimeError("Signup failed. Check email & password and try again.")
 
 def login_email_password(email: str, password: str) -> Dict[str, Any]:
-    auth, _ = get_clients()
-    return auth.sign_in_with_email_and_password(email, password)
+    """Signs in and returns pyrebase user dict."""
+    try:
+        user = _auth.sign_in_with_email_and_password(email, password)
+        ensure_user(user["localId"], email=email)
+        return user
+    except Exception as e:
+        msg = str(e)
+        if "INVALID_LOGIN_CREDENTIALS" in msg or "EMAIL_NOT_FOUND" in msg:
+            raise RuntimeError("Wrong email or password.")
+        if "INVALID_EMAIL" in msg:
+            raise RuntimeError("That email looks invalid.")
+        raise RuntimeError("Login failed. Please try again.")
 
+# --------------- Interactions (Firestore, admin) ---------------
 def add_interaction(uid: str, item_id: str, action: str) -> None:
-    _, db = get_clients()
-    ensure_user(db, uid)
-    payload = {
-        "uid": uid,
-        "item_id": str(item_id),
-        "action": action,  # "like" | "bag"
-        "ts": datetime.now(timezone.utc).isoformat()
-    }
-    db.collection(USERS_COLL).document(uid).collection(USER_INTERACTIONS_SUB).add(payload)
-    db.collection(GLOBAL_INTERACTIONS).add(payload)
+    """Write to users/{uid}/interactions and to global feed."""
+    ensure_user(uid)
+    payload = {"uid": uid, "item_id": item_id, "action": action, "ts": _now_iso()}
+    _db.collection(USERS_COLL).document(uid).collection(USER_INTERACTIONS_SUB).add(payload)
+    _db.collection(GLOBAL_INTERACTIONS).add(payload)
+
+def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
+    ensure_user(uid)
+    q = (_db.collection(USERS_COLL).document(uid)
+         .collection(USER_INTERACTIONS_SUB)
+         .order_by("ts", direction=firestore.Query.DESCENDING)
+         .limit(limit))
+    return [d.to_dict() for d in q.stream() if d.to_dict()]
+
+def fetch_global_interactions(limit: int = 1000) -> List[Dict[str, Any]]:
+    q = (_db.collection(GLOBAL_INTERACTIONS)
+         .order_by("ts", direction=firestore.Query.DESCENDING)
+         .limit(limit))
+    return [d.to_dict() for d in q.stream() if d.to_dict()]
 
 def remove_interaction(uid: str, item_id: str, action: str) -> None:
-    _, db = get_clients()
-    ensure_user(db, uid)
-    # user scoped
-    sub = db.collection(USERS_COLL).document(uid).collection(USER_INTERACTIONS_SUB)
-    for d in sub.where("item_id", "==", str(item_id)).where("action", "==", action).stream():
+    ensure_user(uid)
+    # user scope
+    uc = _db.collection(USERS_COLL).document(uid).collection(USER_INTERACTIONS_SUB)
+    for d in uc.where("item_id", "==", item_id).where("action", "==", action).stream():
         d.reference.delete()
     # global
-    glob = db.collection(GLOBAL_INTERACTIONS)
-    for d in glob.where("uid", "==", uid).where("item_id", "==", str(item_id)).where("action", "==", action).stream():
+    gc = _db.collection(GLOBAL_INTERACTIONS)
+    for d in gc.where("uid", "==", uid).where("item_id", "==", item_id).where("action", "==", action).stream():
         d.reference.delete()
-
-def fetch_user_interactions(uid: str, limit: int = 300) -> List[Dict[str, Any]]:
-    _, db = get_clients()
-    ensure_user(db, uid)
-    q = (db.collection(USERS_COLL)
-           .document(uid)
-           .collection(USER_INTERACTIONS_SUB)
-           .order_by("ts", direction=firestore.Query.DESCENDING)
-           .limit(limit))
-    return [d.to_dict() for d in q.stream() if d]
-
-def fetch_global_interactions(limit: int = 2000) -> List[Dict[str, Any]]:
-    _, db = get_clients()
-    q = (db.collection(GLOBAL_INTERACTIONS)
-           .order_by("ts", direction=firestore.Query.DESCENDING)
-           .limit(limit))
-    return [d.to_dict() for d in q.stream() if d]
