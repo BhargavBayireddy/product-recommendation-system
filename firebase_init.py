@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple, Set
 from datetime import datetime, timezone
 
 # --- Third-party ---
@@ -16,7 +16,7 @@ FOLDER = BASE / "firebase"
 WEB_JSON = FOLDER / "firebaseConfig.json"          # <- your Web API keys (from Firebase console)
 SA_JSON  = FOLDER / "serviceAccount.json"          # <- your Service Account JSON (Project settings -> Service accounts)
 
-# ---------- Load configs (helpful error messages) ----------
+# ---------- Load configs ----------
 def _load_web_config() -> Dict[str, Any]:
     if not WEB_JSON.exists():
         raise FileNotFoundError(
@@ -25,8 +25,6 @@ def _load_web_config() -> Dict[str, Any]:
         )
     with open(WEB_JSON, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-
-    # pyrebase expects a databaseURL key even if you only use Auth/Firestore.
     if "databaseURL" not in cfg:
         project_id = cfg.get("projectId") or ""
         cfg["databaseURL"] = f"https://{project_id}.firebaseio.com"
@@ -50,15 +48,13 @@ def _init_admin() -> firestore.Client:
 _web_cfg = _load_web_config()
 _fb_app  = pyrebase.initialize_app(_web_cfg)
 _auth    = _fb_app.auth()
-
-_db = _init_admin()  # Firestore client
+_db      = _init_admin()  # Firestore client
 
 
 # ------------------------------------------------------------
-# Email / Password auth (client) via pyrebase
+# Auth
 # ------------------------------------------------------------
 def signup_email_password(email: str, password: str) -> Dict[str, Any]:
-    """Create user using Firebase Auth (client API)."""
     try:
         user = _auth.create_user_with_email_and_password(email, password)
         ensure_user(user["localId"], email=email)
@@ -68,7 +64,6 @@ def signup_email_password(email: str, password: str) -> Dict[str, Any]:
 
 
 def login_email_password(email: str, password: str) -> Dict[str, Any]:
-    """Sign in with email/password"""
     try:
         user = _auth.sign_in_with_email_and_password(email, password)
         return user
@@ -77,10 +72,9 @@ def login_email_password(email: str, password: str) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# Firestore helper primitives
+# Firestore helpers
 # ------------------------------------------------------------
 def ensure_user(uid: str, email: str | None = None) -> None:
-    """Create user doc if missing."""
     doc_ref = _db.collection("users").document(uid)
     snap = doc_ref.get()
     if not snap.exists:
@@ -92,17 +86,23 @@ def ensure_user(uid: str, email: str | None = None) -> None:
 
 
 def add_interaction(uid: str, item_id: str, action: str) -> None:
-    """Write interaction to users/{uid}/interactions/{auto-id}"""
+    """
+    Write interaction to:
+      - users/{uid}/interactions
+      - interactions_global  (so other users' recs learn from it)
+    """
     ensure_user(uid)
-    _db.collection("users").document(uid).collection("interactions").add({
+    payload = {
+        "uid": uid,
         "item_id": item_id,
         "action": action,
         "ts": datetime.now(timezone.utc).isoformat()
-    })
+    }
+    _db.collection("users").document(uid).collection("interactions").add(payload)
+    _db.collection("interactions_global").add(payload)   # NEW: global log
 
 
 def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
-    """Fetch recent interactions for a user"""
     ensure_user(uid)
     q = (_db.collection("users")
              .document(uid)
@@ -115,11 +115,55 @@ def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
 
 def remove_interaction(uid: str, item_id: str, action: str) -> None:
     """
-    Delete matching interaction docs from Firestore.
-    Removes ALL docs that match (item_id, action).
+    Delete matching interaction docs from:
+      - users/{uid}/interactions
+      - interactions_global (for that uid)
+    Removes ALL docs that match (uid, item_id, action).
     """
     ensure_user(uid)
-    coll = _db.collection("users").document(uid).collection("interactions")
-    docs = coll.where("item_id", "==", item_id).where("action", "==", action).stream()
-    for d in docs:
+
+    # user subcollection
+    coll_user = _db.collection("users").document(uid).collection("interactions")
+    for d in coll_user.where("item_id", "==", item_id).where("action", "==", action).stream():
         d.reference.delete()
+
+    # global collection (only those created by this uid)
+    coll_global = _db.collection("interactions_global")
+    for d in coll_global.where("uid", "==", uid).where("item_id", "==", item_id).where("action", "==", action).stream():
+        d.reference.delete()
+
+
+# ------------------------------------------------------------
+# GLOBAL collaborative helpers (aggressive mode)
+# ------------------------------------------------------------
+def fetch_global_likes_for_items(item_ids: List[str], limit_users_per_item: int = 100) -> Dict[str, Set[str]]:
+    """
+    For each item in item_ids, return a set of uids who liked/bagged it.
+    """
+    out: Dict[str, Set[str]] = {}
+    coll = _db.collection("interactions_global")
+    for iid in item_ids:
+        uids: Set[str] = set()
+        q = coll.where("item_id", "==", iid).where("action", "in", ["like", "bag"]).order_by("ts", direction=firestore.Query.DESCENDING).limit(limit_users_per_item)
+        for d in q.stream():
+            obj = d.to_dict() or {}
+            u = obj.get("uid"); 
+            if u: uids.add(u)
+        out[iid] = uids
+    return out
+
+
+def fetch_items_liked_by_users(uids: List[str], exclude_items: Set[str], per_user_limit: int = 100) -> List[str]:
+    """
+    Get items those users liked/bagged, excluding exclude_items.
+    """
+    out: List[str] = []
+    coll = _db.collection("interactions_global")
+    for u in uids:
+        q = coll.where("uid", "==", u).where("action", "in", ["like", "bag"]).order_by("ts", direction=firestore.Query.DESCENDING).limit(per_user_limit)
+        for d in q.stream():
+            obj = d.to_dict() or {}
+            iid = obj.get("item_id")
+            if iid and iid not in exclude_items:
+                out.append(iid)
+    return out
