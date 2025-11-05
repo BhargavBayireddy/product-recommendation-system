@@ -1,4 +1,3 @@
-# firebase_init.py
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -59,24 +58,17 @@ _db = _init_admin()  # Firestore client
 # Email / Password auth (client) via pyrebase
 # ------------------------------------------------------------
 def signup_email_password(email: str, password: str) -> Dict[str, Any]:
-    """
-    Create user using Firebase Auth (client API).
-    Returns a dict containing idToken, localId, etc.
-    """
+    """Create user using Firebase Auth (client API)."""
     try:
         user = _auth.create_user_with_email_and_password(email, password)
-        # Also ensure a user doc exists in Firestore
         ensure_user(user["localId"], email=email)
         return user
     except Exception as e:
-        # Bubble a clean string (Streamlit will display it)
         raise RuntimeError(f"Signup error: {e}")
 
 
 def login_email_password(email: str, password: str) -> Dict[str, Any]:
-    """
-    Sign in with email/password. Returns the pyrebase user dict with 'localId', 'idToken', ...
-    """
+    """Sign in with email/password"""
     try:
         user = _auth.sign_in_with_email_and_password(email, password)
         return user
@@ -88,9 +80,7 @@ def login_email_password(email: str, password: str) -> Dict[str, Any]:
 # Firestore helper primitives
 # ------------------------------------------------------------
 def ensure_user(uid: str, email: str | None = None) -> None:
-    """
-    Create user doc if missing: users/{uid}
-    """
+    """Create user doc if missing."""
     doc_ref = _db.collection("users").document(uid)
     snap = doc_ref.get()
     if not snap.exists:
@@ -102,21 +92,17 @@ def ensure_user(uid: str, email: str | None = None) -> None:
 
 
 def add_interaction(uid: str, item_id: str, action: str) -> None:
-    """
-    Write user interaction to subcollection: users/{uid}/interactions/{auto-id}
-    """
+    """Write interaction to users/{uid}/interactions/{auto-id}"""
     ensure_user(uid)
     _db.collection("users").document(uid).collection("interactions").add({
         "item_id": item_id,
-        "action": action,  # e.g., like / add / watch / buy
+        "action": action,
         "ts": datetime.now(timezone.utc).isoformat()
     })
 
 
 def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
-    """
-    Fetch recent interactions for a user, most recent first.
-    """
+    """Fetch recent interactions for a user"""
     ensure_user(uid)
     q = (_db.collection("users")
              .document(uid)
@@ -124,8 +110,16 @@ def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
              .order_by("ts", direction=firestore.Query.DESCENDING)
              .limit(limit))
     docs = q.stream()
-    out: List[Dict[str, Any]] = []
+    return [d.to_dict() for d in docs if d.to_dict()]
+
+
+def remove_interaction(uid: str, item_id: str, action: str) -> None:
+    """
+    Delete matching interaction docs from Firestore.
+    Removes ALL docs that match (item_id, action).
+    """
+    ensure_user(uid)
+    coll = _db.collection("users").document(uid).collection("interactions")
+    docs = coll.where("item_id", "==", item_id).where("action", "==", action).stream()
     for d in docs:
-        obj = d.to_dict() or {}
-        out.append(obj)
-    return out
+        d.reference.delete()
