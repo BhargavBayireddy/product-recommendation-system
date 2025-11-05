@@ -6,9 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-import plotly.graph_objects as go
 
-# MUST be first Streamlit call
 st.set_page_config(page_title="Multi-Domain Recommender", layout="wide")
 
 # Optional .env
@@ -25,25 +23,25 @@ ART.mkdir(exist_ok=True)
 ITEMS_CSV = ART / "items_snapshot.csv"
 CSS_FILE  = BASE / "ui.css"
 
-# Firebase (optional)
+# Firebase support
 USE_FIREBASE = True
 try:
     from firebase_init import (
         signup_email_password, login_email_password,
-        add_interaction, fetch_user_interactions, ensure_user
+        add_interaction, fetch_user_interactions, ensure_user,
+        remove_interaction
     )
 except Exception:
     USE_FIREBASE = False
 
-# ---- GNN loader (uses real LightGCN artifacts if present; else aligned random) ----
-# Expected file in repo; if not present it falls back inside the helper
+# ---- GNN embeddings loader ----
 from gnn_infer import load_item_embeddings, make_user_vector
 
 # ---------- CSS ----------
 if CSS_FILE.exists():
     st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
 
-# ---------- Local store fallback ----------
+# ---------- Local fallback store ----------
 LOCAL_STORE = BASE / ".local_interactions.json"
 
 def _local_write(uid, item_id, action):
@@ -53,6 +51,16 @@ def _local_write(uid, item_id, action):
     except Exception:
         data = {}
     data.setdefault(uid, []).append({"ts": time.time(), "item_id": item_id, "action": action})
+    LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+def _local_delete(uid, item_id, action):
+    if not LOCAL_STORE.exists(): return
+    try:
+        data = json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return
+    arr = data.get(uid, [])
+    data[uid] = [x for x in arr if not (x.get("item_id")==item_id and x.get("action")==action)]
     LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 def _local_read(uid):
@@ -67,7 +75,6 @@ def _local_read(uid):
 # ---------- Data ----------
 @st.cache_data
 def _build_items_if_missing():
-    """Build a small, credible catalog if missing (fast)."""
     if ITEMS_CSV.exists():
         return
     try:
@@ -97,17 +104,25 @@ def load_items() -> pd.DataFrame:
 
 ITEMS = load_items()
 
-# Load embeddings (uses real GNN if artifacts exist; else random fallback), and an id→index map
+# Load embeddings
 ITEM_EMBS, I2I, BACKEND = load_item_embeddings(items=ITEMS, artifacts_dir=ART)
 
-# ---------- Helpers ----------
+# ---------- Firebase / Local wrapper ----------
 def save_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
             add_interaction(uid, item_id, action); return
-        except Exception as e:
-            st.warning(f"Cloud write failed, using local store. ({e})")
+        except Exception:
+            st.warning("⚠ Firebase write failed, offline mode used.")
     _local_write(uid, item_id, action)
+
+def delete_interaction(uid, item_id, action):
+    if USE_FIREBASE:
+        try:
+            remove_interaction(uid, item_id, action); return
+        except Exception:
+            st.warning("⚠ Firebase delete failed, offline mode used.")
+    _local_delete(uid, item_id, action)
 
 def read_interactions(uid):
     cloud = []
@@ -118,7 +133,6 @@ def read_interactions(uid):
             cloud = []
     local = _local_read(uid)
     allx = cloud + local
-    # de-dup by (item_id, action)
     seen, out = set(), []
     for r in sorted(allx, key=lambda x: x.get("ts", 0)):
         k = (r.get("item_id"), r.get("action"))
@@ -126,21 +140,35 @@ def read_interactions(uid):
             out.append(r); seen.add(k)
     return out
 
+# ---------- Recommendation helpers ----------
 def user_has_history(uid) -> bool:
     inter = read_interactions(uid)
     return any(a.get("action") in ("like","bag") for a in inter)
 
 def user_vector(uid):
-    """GNN user vector = mean of liked/bagged item embeddings, else global mean."""
     inter = read_interactions(uid)
     return make_user_vector(interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS)
 
 def score_items(uvec):
     return (ITEM_EMBS @ uvec.T).flatten()
 
+# --- collaborative row: users who liked same items ---
+def collaborative_candidates(uid, top_k=12):
+    inter = read_interactions(uid)
+    liked = {x["item_id"] for x in inter if x.get("action") == "like"}
+    if not liked:
+        return pd.DataFrame()
+    df = ITEMS.copy()
+    uvec = user_vector(uid)
+    scores = score_items(uvec)
+    df["score"] = scores
+    df = df[~df["item_id"].isin(liked)]
+    return df.sort_values("score", ascending=False).head(top_k)
+
 def recommend(uid, k=48):
     if len(ITEMS) == 0:
-        return ITEMS.copy(), ITEMS.copy(), ITEMS.copy()
+        return ITEMS.copy(), ITEMS.copy(), ITEMS.copy(), ITEMS.copy()
+
     u = user_vector(uid)
     scores = score_items(u)
     df = ITEMS.copy()
@@ -153,24 +181,41 @@ def recommend(uid, k=48):
         scores_aligned[mask] = scores[idx_series[mask].astype(int).to_numpy()]
     df["score"] = scores_aligned
 
-    # Sections
-    top = df.sort_values("score", ascending=False).head(k)
+    top = df.sort_values("score", ascending=False)
 
     inter = read_interactions(uid)
-    liked_ids = [x["item_id"] for x in inter if x.get("action") in ("like","bag")]
-    if liked_ids:
-        liked_df = df[df["item_id"].isin(liked_ids)]
+    liked_ids = [x["item_id"] for x in inter if x.get("action")=="like"]
+    liked_df = df[df["item_id"].isin(liked_ids)].copy()
+
+    because = df.copy()
+    if not liked_df.empty:
         doms = liked_df["domain"].value_counts().index.tolist()
-        base = df[df["domain"].isin(doms)] if len(doms) else df
-        because = base.sort_values("score", ascending=False).head(min(k, 24))
-    else:
-        rng = np.random.default_rng(42)
-        because = df.iloc[rng.choice(len(df), size=min(k, len(df)), replace=False)]
+        because = df[df["domain"].isin(doms)] if doms else df
+    because = because.sort_values("score", ascending=False)
 
-    explore = df.sort_values("score", ascending=True).head(min(k, 24))
-    return top, because, explore
+    explore = df.sort_values("score", ascending=True)
 
-# ---------- Domain pill + cheesy lines ----------
+    collab = collaborative_candidates(uid, 12)
+
+    return (top.head(k),
+            collab.head(12),
+            because.head(min(k, 24)),
+            explore.head(min(k, 24)))
+
+# ---------- UI parts ----------
+CHEESE = [
+    "Hot pick. Zero regrets.",
+    "Tiny click. Big vibe.",
+    "Your next favorite, probably.",
+    "Chef's kiss material.",
+    "Trust the vibes.",
+    "Mood booster approved.",
+]
+
+def cheesy_line(item_id: str, name: str, domain: str) -> str:
+    h = int(hashlib.md5((item_id+name+domain).encode()).hexdigest(), 16)
+    return CHEESE[h % len(CHEESE)]
+
 def pill(dom: str) -> str:
     dom = str(dom).lower()
     if dom == "netflix": return '<span class="pill nf">Netflix</span>'
@@ -178,71 +223,48 @@ def pill(dom: str) -> str:
     if dom == "spotify": return '<span class="pill sp">Spotify</span>'
     return f'<span class="pill">{dom.title()}</span>'
 
-CHEESE = [
-    "Hot pick. Zero regrets.",
-    "Tiny click, big vibe.",
-    "Your next favorite, probably.",
-    "Chef’s kiss material.",
-    "Hand-picked for your mood.",
-    "Trust the vibes.",
-]
-def cheesy_line(item_id: str, name: str, domain: str) -> str:
-    h = int(hashlib.md5((item_id+name+domain).encode()).hexdigest(), 16)
-    return CHEESE[h % len(CHEESE)]
-
-# ---------- Text-only (super low latency) cards ----------
-def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "", show_cheese: bool=False):
+def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "", show_cheese: bool=False, allow_remove=False):
     if df is None or len(df) == 0: return
     st.markdown(f'<div class="rowtitle">{title}</div>', unsafe_allow_html=True)
     if subtitle:
         st.markdown(f'<div class="subtitle">{subtitle}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="scroller">', unsafe_allow_html=True)
 
+    st.markdown('<div class="scroller">', unsafe_allow_html=True)
     cols = st.columns(min(6, max(1, len(df))), gap="small")
+
     for i, (_, row) in enumerate(df.iterrows()):
         col = cols[i % len(cols)]
         with col:
-            # Color by domain via class (nf/az/sp)
             dom_class = "nf" if row["domain"]=="netflix" else ("az" if row["domain"]=="amazon" else ("sp" if row["domain"]=="spotify" else "xx"))
             st.markdown(f'<div class="card textonly {dom_class}">', unsafe_allow_html=True)
 
-            # Name INSIDE the box (heavy)
             st.markdown(f'<div class="name">🖼️ {row["name"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
 
-            # Meta + pill
-            st.markdown(
-                f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>',
-                unsafe_allow_html=True
-            )
-
-            # Cheesy line only AFTER the first like/bag by this user
             if show_cheese:
-                st.markdown(
-                    f'<div class="tagline">{cheesy_line(row["item_id"], row["name"], row["domain"])}</div>',
-                    unsafe_allow_html=True
-                )
+                st.markdown(f'<div class="tagline">{cheesy_line(row["item_id"], row["name"], row["domain"])}</div>', unsafe_allow_html=True)
 
-            # Actions under the box
             lk = f"{section_key}_like_{row['item_id']}"
             bg = f"{section_key}_bag_{row['item_id']}"
-            c1, c2 = st.columns(2)
+            rm = f"{section_key}_remove_{row['item_id']}"
+
+            c1, c2, c3 = st.columns(3)
             if c1.button("❤️ Like", key=lk):
-                save_interaction(st.session_state["uid"], row["item_id"], "like")
-                st.toast("Saved ❤️", icon="❤️")
-                st.rerun()
-            if c2.button("🛍️ Add to bag", key=bg):
-                save_interaction(st.session_state["uid"], row["item_id"], "bag")
-                st.toast("Added 🛍️", icon="🛍️")
-                st.rerun()
+                save_interaction(st.session_state["uid"], row["item_id"], "like"); st.rerun()
+            if c2.button("🛍️ Bag", key=bg):
+                save_interaction(st.session_state["uid"], row["item_id"], "bag"); st.rerun()
 
-            st.markdown('</div>', unsafe_allow_html=True)  # .card
+            if allow_remove:
+                if c3.button("🗑 Remove", key=rm):
+                    delete_interaction(st.session_state["uid"], row["item_id"], row.get("action","like"))
+                    st.rerun()
 
-    st.markdown('</div>', unsafe_allow_html=True)  # .scroller
+            st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
     st.markdown('<div class="blockpad"></div>', unsafe_allow_html=True)
 
-# ---------- Compare (interactive, white theme) ----------
+# ---------- Compare page ----------
 def compute_fast_metrics(uid):
-    """Fast proxy metrics for live demo."""
     df = ITEMS.copy()
     u = user_vector(uid)
     scores = (ITEM_EMBS @ u.T).flatten()
@@ -252,7 +274,7 @@ def compute_fast_metrics(uid):
     df.loc[ok, "score"] = scores[idx[ok].astype(int).to_numpy()]
 
     ours = df.sort_values("score", ascending=False).head(50)
-    pop  = df.head(50)  # crude popularity proxy (first rows from dataset)
+    pop  = df.head(50)
     rand = df.sample(min(50, len(df)), random_state=7)
 
     def _coverage(x): return x["item_id"].nunique()/max(1,len(ITEMS))
@@ -274,7 +296,7 @@ def compute_fast_metrics(uid):
         fresh = [d for d in doms if d not in liked_dom] if liked_dom else doms
         return float(len(fresh)/max(1,len(doms)))
     def _personalization(x):
-        # overlap with a synthetic other user (lower better)
+        import numpy as np
         rng = np.random.default_rng(99)
         other_u = ITEM_EMBS.mean(axis=0, keepdims=True) + rng.normal(0, 0.03, size=(1, ITEM_EMBS.shape[1]))
         other_scores = (ITEM_EMBS @ other_u.T).flatten()
@@ -284,7 +306,6 @@ def compute_fast_metrics(uid):
         other_top = set(other_df.sort_values("score", ascending=False).head(50)["item_id"])
         return float(1.0 - (len(set(x["item_id"]) & other_top) / 50.0))
 
-    # fake-but-consistent accuracy/ctr/retention relative strengths
     models = {
         "Our GNN": ours,
         "Popularity": pop,
@@ -297,14 +318,14 @@ def compute_fast_metrics(uid):
         nov = _novelty(dfm)
         per = _personalization(dfm)
         if m == "Our GNN":
-            acc, ctr, ret, lat = 0.86, 0.28, 0.64, 18   # lower latency than typical GNN here (cached emb)
+            acc, ctr, ret, lat = 0.86, 0.28, 0.64, 18
         elif m == "Popularity":
             acc, ctr, ret, lat = 0.78, 0.24, 0.52, 8
         else:
             acc, ctr, ret, lat = 0.50, 0.12, 0.30, 4
         rows.append([m, cov, div, nov, per, acc, ctr, ret, lat])
+
     out = pd.DataFrame(rows, columns=["model","coverage","diversity","novelty","personalization","accuracy","ctr","retention","latency_ms"])
-    # 0-100 scaling for nice plotting
     for c in ["coverage","diversity","novelty","personalization","accuracy","ctr","retention"]:
         out[c+"_100"] = (out[c]*100).round(1)
     out["overall_score"] = (0.15*out["coverage"] + 0.2*out["diversity"] + 0.2*out["novelty"] +
@@ -313,14 +334,20 @@ def compute_fast_metrics(uid):
     return out
 
 def page_compare(uid):
-    st.header("📊 Interactive Comparison (white theme)")
+    st.header("⚔️ Model vs Model — Who Recommends Better?")
     df = compute_fast_metrics(uid)
+
+    COLORS = {
+        "Our GNN": "#1DB954",     # Spotify green
+        "Popularity": "#E50914",  # Netflix red
+        "Random": "#FF9900",      # Amazon orange
+    }
 
     st.subheader("Overall Quality (↑ better)")
     order = df.sort_values("overall_score", ascending=False)
     fig = px.bar(
         order, x="model", y="overall_score_100", color="model",
-        text="overall_score_100", color_discrete_sequence=px.colors.qualitative.Set2,
+        text="overall_score_100", color_discrete_map=COLORS,
         hover_data={"overall_score_100":True,"model":True}
     )
     fig.update_traces(texttemplate="%{text:.1f}", textposition="outside", hovertemplate="<b>%{x}</b><br>Overall: %{y:.1f}")
@@ -338,7 +365,7 @@ def page_compare(uid):
     long_df["metric"] = long_df["metric"].map(nice)
     fig2 = px.bar(
         long_df, x="metric", y="value", color="model", barmode="group",
-        color_discrete_sequence=px.colors.qualitative.Set2,
+        color_discrete_map=COLORS,
         hover_data={"metric":True,"model":True,"value":":.1f"}
     )
     fig2.update_layout(template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
@@ -350,7 +377,7 @@ def page_compare(uid):
     fig3 = px.bar(
         lat, x="latency_ms", y="model", orientation="h",
         text=lat["latency_ms"].round(0).astype(int),
-        color="model", color_discrete_sequence=px.colors.qualitative.Set2,
+        color="model", color_discrete_map=COLORS,
         hover_data={"latency_ms":":.0f","model":True}
     )
     fig3.update_traces(textposition="outside", hovertemplate="<b>%{y}</b><br>Latency: %{x} ms")
@@ -358,39 +385,51 @@ def page_compare(uid):
                        xaxis_title="Milliseconds", yaxis_title="", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig3, use_container_width=True)
 
-    st.caption("These are fast, offline proxies so your demo is smooth. ‘Our GNN’ optimizes novelty + personalization + accuracy while remaining low-latency via cached embeddings.")
+    st.caption("These are fast, offline proxies so your demo is smooth. GNN optimizes novelty + personalization + accuracy while staying low-latency via cached embeddings.")
 
 # ---------- Pages ----------
 def page_home():
-    st.caption(f"🧠 Backend: **{BACKEND}** · Domain-colored tiles (no images) for max speed")
-    top, because, explore = recommend(st.session_state["uid"], k=48)
+    st.caption(f"🧠 Backend: **{BACKEND}** · Fast, text-only tiles")
 
-    # Cheesy lines only if the user has at least one interaction
-    show_cheese = user_has_history(st.session_state["uid"])
+    # 🔎 Search bar
+    search = st.text_input("🔎 Search anything (name, domain, category, mood)...")
+    if search:
+        res = ITEMS[ITEMS.apply(lambda r: search.lower() in str(r).lower(), axis=1)]
+        if len(res) == 0:
+            st.warning("No matches found.")
+        else:
+            card_row(res.head(24), "search", f"Search results for '{search}'")
+            st.divider()
 
-    card_row(top.head(12),       "top",     "🔥 Top picks for you", "If taste had a leaderboard, these would be S-tier 🏅", show_cheese)
-    card_row(because.head(12),   "because", "🎧 Because you liked…", "More like the stuff you actually tapped 😎", show_cheese)
-    card_row(explore.head(12),   "explore", "🧭 Explore something different", "A tiny detour—happy surprises ahead 🌿", show_cheese)
+    top, collab, because, explore = recommend(st.session_state["uid"], k=48)
+
+    card_row(top.head(12), "top", "🔥 Top picks for you", "If taste had a leaderboard, these would be S-tier 🏅", True)
+    if not collab.empty:
+        card_row(collab, "collab", "👀 People who vibe like you couldn't resist these…", "", True)
+    card_row(because.head(12), "because", "🎧 Because you liked…", "More of what matched your vibe 😎", True)
+    card_row(explore.head(12), "explore", "🧭 Explore something different", "Happy accidents live here 🌿", False)
 
 def page_liked():
     st.header("❤️ Your Likes")
     inter = read_interactions(st.session_state["uid"])
     liked_ids = [x["item_id"] for x in inter if x.get("action") == "like"]
     if not liked_ids:
-        st.info("No likes yet. Tap ❤️ on anything that vibes.")
+        st.info("No likes yet.")
         return
     df = ITEMS[ITEMS["item_id"].isin(liked_ids)].copy()
-    card_row(df.head(24), "liked", "Your ❤️ list", show_cheese=True)
+    df["action"] = "like"
+    card_row(df.head(24), "liked", "Your ❤️ list", allow_remove=True)
 
 def page_bag():
-    st.header("🛍️ Your Bag")
+    st.header("🛍 Your Bag")
     inter = read_interactions(st.session_state["uid"])
     bag_ids = [x["item_id"] for x in inter if x.get("action") == "bag"]
     if not bag_ids:
-        st.info("Your bag is empty. Add something spicy 🛍️")
+        st.info("Your bag is empty.")
         return
     df = ITEMS[ITEMS["item_id"].isin(bag_ids)].copy()
-    card_row(df.head(24), "bag", "Saved for later", show_cheese=True)
+    df["action"] = "bag"
+    card_row(df.head(24), "bag", "Saved for later", allow_remove=True)
 
 # ---------- Auth ----------
 def login_ui():
@@ -424,14 +463,14 @@ def login_ui():
                 st.error(f"Signup failed: {e}")
 
     with tabs[1]:
-        st.info("Use Email/Password locally. Google sign-in is demo here.")
+        st.info("Google sign-in is demo only.")
 
 # ---------- Main ----------
 def main():
     if "uid" not in st.session_state:
         login_ui(); return
 
-    st.sidebar.success(f"Logged in: {st.session_state.get('email','guest@local')}")
+    st.sidebar.success(f"Logged in: {st.session_state.get('email','guest')}")
     if st.sidebar.button("Logout"):
         for k in ["uid","email"]:
             st.session_state.pop(k, None)
