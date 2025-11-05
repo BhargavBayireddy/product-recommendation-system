@@ -1,0 +1,105 @@
+/* Page base */
+:root {
+  --nf: #ff6b6b;      /* Netflix pastel red */
+  --az: #ff922b;      /* Amazon pastel orange */
+  --sp: #2ecc71;      /* Spotify pastel green */
+  --ink: #111;
+  --muted: #666;
+  --pill: #ffffffcc;
+}
+html, body {
+  background: #fff !important;
+  color: var(--ink);
+}
+
+/* Row titles */
+.rowtitle {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 6px 2px 2px 2px;
+}
+.subtitle {
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+/* Horizontal scroller */
+.scroller {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+}
+
+/* Cards (text only) */
+.card.textonly {
+  padding: 14px 14px 12px 14px;
+  border-radius: 14px;
+  color: #111;
+  box-shadow: 0 2px 10px rgba(0,0,0,.08);
+  min-height: 130px;
+}
+.card.textonly.nf { background: var(--nf); color: #081018; }
+.card.textonly.az { background: var(--az); color: #081018; }
+.card.textonly.sp { background: var(--sp); color: #081018; }
+.card.textonly.xx { background: #e9ecef; }
+
+.card .name {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.2;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+.card .cap {
+  font-size: 12px;
+  color: #111;
+  margin-bottom: 8px;
+}
+.card .tagline {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  opacity: .95;
+}
+
+/* Domain pills */
+.pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--pill);
+  border: 1px solid rgba(0,0,0,.08);
+  font-size: 11px;
+  font-weight: 700;
+  margin-left: 6px;
+}
+.pill.nf { color: #e50914; }
+.pill.az { color: #c96f00; }
+.pill.sp { color: #1db954; }
+
+/* Spacing after rows */
+.blockpad { height: 14px; }
+
+/* Buttons look white (fix black buttons) */
+.stButton > button {
+  background: #fff !important;
+  color: var(--ink) !important;
+  border: 1px solid rgba(0,0,0,.15) !important;
+  border-radius: 10px !important;
+  padding: 6px 10px !important;
+  font-weight: 700 !important;
+  box-shadow: 0 1px 6px rgba(0,0,0,.06) !important;
+}
+.stButton > button:hover {
+  filter: brightness(0.98);
+}
+
+/* Sidebar radio / widgets — white */
+.css-1cypcdb, .sidebar .stRadio, .stRadio, .stSelectbox {
+  background: transparent !important;
+}
+
+/* Plotly white theme already set in code; ensure container is white */
+.css-1dp5vir, .css-ocqkz7, .stPlotlyChart {
+  background: #fff !important;
+}
