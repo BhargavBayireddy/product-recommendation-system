@@ -1,90 +1,70 @@
 # recommender.py
 from __future__ import annotations
+from pathlib import Path
+from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
-from pathlib import Path
+from sklearn.metrics.pairwise import cosine_similarity
 
 from gnn_infer import load_item_embeddings, make_user_vector
 
-def _normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    n = np.linalg.norm(v, axis=-1, keepdims=True) + eps
-    return v / n
+def prepare_items(items_df: pd.DataFrame) -> pd.DataFrame:
+    items = items_df.copy()
+    # must have: item_id, title, domain, provider columns
+    for col, default in [("domain","Entertainment"), ("provider","")]:
+        if col not in items.columns:
+            items[col] = default
+    return items
 
-def _cosine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    return (_normalize(a) @ _normalize(b).T)
-
-def build_catalog(items_df: pd.DataFrame) -> pd.DataFrame:
-    df = items_df.copy()
-    # Ensure columns
-    for col in ["item_id","name","domain","category","mood"]:
-        if col not in df.columns: df[col] = ""
-    df["query_blob"] = (df["name"].astype(str) + " " + df["domain"].astype(str) +
-                        " " + df["category"].astype(str) + " " + df["mood"].astype(str)).str.lower()
-    return df
-
-def search_live(df: pd.DataFrame, q: str, limit: int = 60) -> pd.DataFrame:
-    if not q: return df.head(0)
-    q = q.strip().lower()
-    # simple fast contains; if many items consider fuzzy
-    m = df["query_blob"].str.contains(q, na=False)
-    out = df[m].copy()
-    # light score: startswith > contains
-    out["_s"] = (out["name"].str.lower().str.startswith(q)).astype(int) * 2 + 1
-    return out.sort_values(["_s","name"], ascending=[False,True]).head(limit).drop(columns=["_s"])
-
-def hybrid_recommend(
-    items_df: pd.DataFrame,
-    interactions_user: List[Dict],
-    interactions_global: List[Dict],
+def recommend_items(
+    items: pd.DataFrame,
+    my_interactions: List[Dict],
+    global_interactions: List[Dict],
     artifacts_dir: Path,
-    k_return: int = 48
+    k_top: int = 48
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    """
-    Returns (top, collab, explore, backend_name)
-    """
-    items = build_catalog(items_df)
-    # --- Embeddings (GNN if available else random fallback) ---
-    emb_mat, iid2idx, backend = load_item_embeddings(items, artifacts_dir)
+    items = prepare_items(items)
+    embs, iid2idx, backend = load_item_embeddings(items, artifacts_dir)
+    uvec = make_user_vector(my_interactions, iid2idx, embs)  # [1, D]
+    sims = cosine_similarity(uvec, embs)[0]  # [N]
+    items = items.copy()
+    items["score_gnn"] = sims
 
-    # User vector from likes/bag
-    uvec = make_user_vector(interactions_user, iid2idx, emb_mat)   # [1, D]
-    scores_content = _cosine(uvec, emb_mat)[0]                     # [N]
+    # hide already interacted
+    seen_ids = {str(x["item_id"]) for x in my_interactions}
+    fresh = items[~items["item_id"].astype(str).isin(seen_ids)]
 
-    # Collaborative: items liked by similar users (global)
-    # Build simple item popularity weighted by "similarity" using overlap on user's likes
-    user_likes = {x["item_id"] for x in interactions_user if x.get("action") in ("like","bag")}
-    pop: Dict[str, float] = {}
-    for row in interactions_global:
-        iid = row.get("item_id")
-        act = row.get("action")
-        if not iid or act not in ("like","bag"): continue
-        # small boost if this item intersects with user likes history domain/category
-        boost = 1.0 + 0.3 * int(iid in user_likes)
-        pop[iid] = pop.get(iid, 0.0) + boost
+    # ---- Top picks (personal) ----
+    top = (fresh.sort_values("score_gnn", ascending=False)
+                .head(k_top))
 
-    collab_scores = np.zeros(len(items), dtype=np.float32)
-    for iid, sc in pop.items():
-        if iid in iid2idx:
-            collab_scores[iid2idx[iid]] += sc
+    # ---- Collab (vibe-twins) ----
+    # Build item -> users and user -> items quickly
+    g = pd.DataFrame(global_interactions) if global_interactions else pd.DataFrame(columns=["uid","item_id","action"])
+    collab = pd.DataFrame(columns=items.columns)
+    if not g.empty:
+        g = g[g["action"].isin(["like","bag"])]
+        # users who touched anything I touched
+        my_seen = {str(x["item_id"]) for x in my_interactions if x["action"] in ("like","bag")}
+        if my_seen:
+            overlap_users = set(g[g["item_id"].astype(str).isin(my_seen)]["uid"])
+            others = g[g["uid"].isin(overlap_users)]
+            candidate_ids = set(others["item_id"].astype(str)) - my_seen
+            collab = items[items["item_id"].astype(str).isin(candidate_ids)].copy()
+            # rank by popularity among overlap users then gnn
+            pop = others.groupby("item_id").size().rename("pop")
+            collab = collab.merge(pop, left_on="item_id", right_index=True, how="left").fillna({"pop":0})
+            collab["score_collab"] = collab["pop"].astype(float) + 0.3*collab["score_gnn"]
+            collab = collab.sort_values(["score_collab","score_gnn"], ascending=False).head(k_top)
 
-    # Blend
-    alpha = 0.65  # content weight
-    blend = alpha * scores_content + (1 - alpha) * (collab_scores / (collab_scores.max() + 1e-8))
+    # ---- Explore (novel) ----
+    # lowest popularity but high gnn among unseen domains
+    def novelty_rank(df):
+        # simple: inverse domain frequency
+        freq = df["domain"].value_counts().to_dict()
+        return df["score_gnn"] * df["domain"].map(lambda d: 1.0/(1+freq.get(d,1)))
+    explore = fresh.copy()
+    explore["novel"] = novelty_rank(explore)
+    explore = explore.sort_values(["novel","score_gnn"], ascending=False).head(k_top)
 
-    # Exclude already strongly interacted items for top section
-    seen = set(user_likes)
-    order = np.argsort(-blend)
-    top_idx = [i for i in order if items.iloc[i]["item_id"] not in seen][:k_return]
-    top = items.iloc[top_idx].copy()
-
-    # Collab section: highest collaborative not already in top
-    collab_order = np.argsort(-collab_scores)
-    collab_idx = [i for i in collab_order if items.iloc[i]["item_id"] not in seen][:k_return]
-    collab_df = items.iloc[collab_idx].copy()
-
-    # Explore: low-similarity/randomized tail
-    tail = items.iloc[order[-(k_return*3):]].sample(min(k_return, len(items)), random_state=7)
-    explore = tail.copy()
-
-    return top, collab_df, explore, backend
+    return top, collab, explore, backend
