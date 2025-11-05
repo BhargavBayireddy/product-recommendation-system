@@ -2,6 +2,8 @@
 import os, json, time, hashlib
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, List
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,7 +11,7 @@ import plotly.express as px
 
 st.set_page_config(page_title="Multi-Domain Recommender", layout="wide")
 
-# -------------------- .env (optional) --------------------
+# -------------------- Optional .env --------------------
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -23,7 +25,7 @@ ART.mkdir(exist_ok=True)
 ITEMS_CSV = ART / "items_snapshot.csv"
 CSS_FILE  = BASE / "ui.css"
 
-# -------------------- Firebase --------------------
+# -------------------- Firebase (REQUIRED) --------------------
 USE_FIREBASE = True
 try:
     from firebase_init import (
@@ -31,8 +33,9 @@ try:
         add_interaction, fetch_user_interactions, ensure_user,
         remove_interaction, fetch_global_interactions
     )
-except Exception:
+except Exception as e:
     USE_FIREBASE = False
+    FB_IMPORT_ERR = str(e)
 
 # -------------------- Embeddings / GNN --------------------
 from gnn_infer import load_item_embeddings, make_user_vector
@@ -47,12 +50,13 @@ def enable_auto_refresh(seconds=5):
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=seconds * 1000, key="auto-refresh-collab")
     except Exception:
+        # Vanilla fallback
         st.markdown(
             f"<script>setTimeout(function(){{window.location.reload();}}, {int(seconds*1000)});</script>",
             unsafe_allow_html=True,
         )
 
-# -------------------- Local fallback store --------------------
+# -------------------- Local fallback store (used only if Firebase write fails) --------------------
 LOCAL_STORE = BASE / ".local_interactions.json"
 
 def _local_write(uid, item_id, action):
@@ -95,7 +99,9 @@ def _build_items_if_missing():
         rows = [
             {"item_id":"nf_0001","name":"Inception","domain":"netflix","category":"entertainment","mood":"engaged","goal":"engaged"},
             {"item_id":"az_0001","name":"Noise Cancelling Headphones","domain":"amazon","category":"product","mood":"focus","goal":"focus"},
-            {"item_id":"sp_0001","name":"Lo-Fi Study Beats","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
+            {"item_id":"sp_0001","name":"Bass Therapy","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
+            {"item_id":"sp_0002","name":"Lo-Fi Study Beats","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
+            {"item_id":"nf_0002","name":"Sabrina","domain":"netflix","category":"entertainment","mood":"chill","goal":"relax"},
         ]
         pd.DataFrame(rows).to_csv(ITEMS_CSV, index=False)
 
@@ -123,16 +129,16 @@ def save_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
             add_interaction(uid, item_id, action); return
-        except Exception:
-            st.warning("⚠ Firebase write failed, using offline store.")
+        except Exception as e:
+            st.warning(f"⚠ Cloud write failed, storing offline. ({e})")
     _local_write(uid, item_id, action)
 
 def delete_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
             remove_interaction(uid, item_id, action); return
-        except Exception:
-            st.warning("⚠ Firebase delete failed, using offline store.")
+        except Exception as e:
+            st.warning(f"⚠ Cloud delete failed, removing offline. ({e})")
     _local_delete(uid, item_id, action)
 
 def read_interactions(uid):
@@ -177,11 +183,10 @@ def _parse_ts(ts_str):
     except Exception:
         return 0.0
 
-# -------- Aggressive collaborative candidates (SHOW ALL, including already-liked) --------
 def collaborative_candidates_aggressive(uid, top_k=12):
     """
     If I liked A and other users also liked A, recommend whatever else they liked.
-    Shows ALL related items (even ones I already liked). Ranked by my score + small recency boost.
+    SHOW ALL (even if I already liked it). Ranked by my score + small recency boost.
     """
     my = read_interactions(uid)
     my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
@@ -192,7 +197,6 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     if not global_events:
         return pd.DataFrame()
 
-    # users who liked anything I liked (exclude me)
     similar_uids = {
         e.get("uid") for e in global_events
         if e.get("action") == "like" and e.get("item_id") in my_likes and e.get("uid") != uid
@@ -200,7 +204,6 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     if not similar_uids:
         return pd.DataFrame()
 
-    # all items those users liked (INCLUDING items I already liked)
     candidate_items = {
         e.get("item_id") for e in global_events
         if e.get("action") == "like" and e.get("uid") in similar_uids
@@ -212,7 +215,6 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     if df.empty:
         return df
 
-    # score by my vector
     uvec = user_vector(uid)
     scores = score_items(uvec)
     idx_series = df["item_id"].map(I2I)
@@ -220,7 +222,6 @@ def collaborative_candidates_aggressive(uid, top_k=12):
     ok = idx_series.notna()
     df.loc[ok, "score"] = scores[idx_series[ok].astype(int).to_numpy()]
 
-    # recency boost
     latest_ts = {}
     cand_set = set(candidate_items)
     for e in global_events:
@@ -254,7 +255,6 @@ def recommend(uid, k=48):
     inter = read_interactions(uid)
     liked_ids = [x["item_id"] for x in inter if x.get("action")=="like"]
     liked_df = df[df["item_id"].isin(liked_ids)].copy()
-
     because = df.copy()
     if not liked_df.empty:
         doms = liked_df["domain"].value_counts().index.tolist()
@@ -263,7 +263,6 @@ def recommend(uid, k=48):
 
     explore = df.sort_values("score", ascending=True)
 
-    # collab row (independent, no de-dup so duplicates allowed as requested)
     collab = collaborative_candidates_aggressive(uid, top_k=12)
     if collab is None or collab.empty or "item_id" not in collab.columns:
         collab = pd.DataFrame(columns=["item_id","name","domain","category","mood","goal","score"])
@@ -320,9 +319,10 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
             c1, c2, c3 = st.columns(3)
             if c1.button("❤️ Like", key=lk):
                 save_interaction(st.session_state["uid"], row["item_id"], "like"); st.rerun()
-            if c2.button("🛍️ Bag", key=bg):
+            if c2.button("🛍️ Add to Bag", key=bg):
                 save_interaction(st.session_state["uid"], row["item_id"], "bag"); st.rerun()
             if allow_remove:
+                # default to 'like' if not specified (liked page) or 'bag' in bag page where we set action=bag
                 act = row.get("action","like")
                 if c3.button("🗑 Remove", key=rm):
                     delete_interaction(st.session_state["uid"], row["item_id"], act); st.rerun()
@@ -405,7 +405,7 @@ def page_compare(uid):
                       xaxis_title="", yaxis_title="Score (0–100)", margin=dict(l=10,r=10,t=40,b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Per-Metric Breakdown (hover for details)")
+    st.subheader("Per-Metric Breakdown")
     metrics = ["coverage_100","diversity_100","novelty_100","personalization_100","accuracy_100","ctr_100","retention_100"]
     nice = {"coverage_100":"Coverage","diversity_100":"Diversity","novelty_100":"Novelty",
             "personalization_100":"Personalization","accuracy_100":"Accuracy","ctr_100":"CTR","retention_100":"Retention"}
@@ -432,7 +432,7 @@ def page_home():
     if live:
         enable_auto_refresh(5)
 
-    # search first (your chosen layout)
+    # Search first
     q = st.text_input("🔎 Search anything (name, domain, category, mood)...").strip()
     if q:
         qlow = q.lower()
@@ -445,11 +445,11 @@ def page_home():
 
     top, collab, because, explore = recommend(st.session_state["uid"], k=48)
 
-    # Now top picks
+    # Top picks
     card_row(top.head(12), "top", "🔥 Top picks for you",
              "If taste had a leaderboard, these would be S-tier 🏅", True)
 
-    # Your vibe-twins (collab) — after top picks
+    # Vibe-twins after top
     if not collab.empty:
         card_row(collab, "collab", "🔥 Your vibe-twins also loved…", show_cheese=True)
 
@@ -469,7 +469,7 @@ def page_liked():
     card_row(df.head(24), "liked", "Your ❤️ list", allow_remove=True)
 
 def page_bag():
-    st.header("🛍 Your Bag")
+    st.header("🛍️ Your Bag")
     inter = read_interactions(st.session_state["uid"])
     bag_ids = [x["item_id"] for x in inter if x.get("action") == "bag"]
     if not bag_ids:
@@ -479,38 +479,68 @@ def page_bag():
     df["action"] = "bag"
     card_row(df.head(24), "bag", "Saved for later", allow_remove=True)
 
-# -------------------- Auth --------------------
+# -------------------- Auth & Login --------------------
+def _parse_firebase_error(msg: str) -> str:
+    s = str(msg)
+    # common pyrebase error substrings
+    if "EMAIL_NOT_FOUND" in s or "user record" in s:
+        return "not_found"
+    if "INVALID_PASSWORD" in s or "INVALID_LOGIN_CREDENTIALS" in s:
+        return "bad_password"
+    if "TOO_MANY_ATTEMPTS_TRY_LATER" in s:
+        return "rate_limited"
+    if "USER_DISABLED" in s:
+        return "disabled"
+    return "generic"
+
 def login_ui():
     st.title("🍿 Multi-Domain Recommender (GNN)")
-    tabs = st.tabs(["Email / Password", "Google (demo)"])
-    with tabs[0]:
-        email = st.text_input("Email")
-        pwd   = st.text_input("Password", type="password")
-        c1, c2 = st.columns(2)
-        if c1.button("Login", use_container_width=True):
-            try:
-                if USE_FIREBASE:
+    if not USE_FIREBASE:
+        st.error("This deployment requires Firebase. Import failed.\n\n" +
+                 "Please ensure Streamlit **Secrets** contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
+        if 'FB_IMPORT_ERR' in globals():
+            st.code(FB_IMPORT_ERR)
+        st.stop()
+
+    st.subheader("Sign in to continue")
+    email = st.text_input("Email")
+    pwd   = st.text_input("Password", type="password")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Sign in", use_container_width=True, type="primary"):
+            if not email or not pwd:
+                st.warning("Email and password required.")
+            else:
+                try:
                     user = login_email_password(email, pwd)
                     st.session_state["uid"] = user["localId"]
                     st.session_state["email"] = email
                     ensure_user(st.session_state["uid"], email=email)
-                else:
-                    st.session_state["uid"] = hashlib.md5(email.encode()).hexdigest()[:10]
-                    st.session_state["email"] = email
-                st.rerun()
-            except Exception as e:
-                st.error(f"Login failed: {e}")
-        if c2.button("Create account", use_container_width=True):
-            try:
-                if USE_FIREBASE:
+                    st.rerun()
+                except Exception as e:
+                    kind = _parse_firebase_error(str(e))
+                    if kind == "not_found":
+                        st.error("Account not found. Please create one.")
+                    elif kind == "bad_password":
+                        st.error("Incorrect password. Try again.")
+                    elif kind == "rate_limited":
+                        st.error("Too many attempts. Try later.")
+                    elif kind == "disabled":
+                        st.error("This account is disabled.")
+                    else:
+                        st.error(f"Login failed. {e}")
+    with c2:
+        if st.button("Create account", use_container_width=True):
+            if not email or not pwd:
+                st.warning("Enter email & password, then click Create account.")
+            else:
+                try:
                     signup_email_password(email, pwd)
-                    st.success("Account created. Click Login.")
-                else:
-                    st.success("Local account ready. Click Login.")
-            except Exception as e:
-                st.error(f"Signup failed: {e}")
-    with tabs[1]:
-        st.info("Google sign-in is demo only.")
+                    st.success("Account created. Now click **Sign in**.")
+                except Exception as e:
+                    st.error(f"Signup failed: {e}")
+
+    st.caption("No guest access. You must sign in to view recommendations.")
 
 # -------------------- Main --------------------
 def main():
