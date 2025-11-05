@@ -192,7 +192,7 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
     for i, (_, row) in enumerate(df.iterrows()):
         with cols[i % len(cols)]:
             st.markdown('<div class="card textonly">', unsafe_allow_html=True)
-            st.markdown(f'<div class="name">🖼️ {row["name"]}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="name"> {row["name"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
             if show_cheese:
                 st.markdown(f'<div class="tagline">{cheesy(row["item_id"], row["name"], row["domain"])}</div>', unsafe_allow_html=True)
@@ -331,7 +331,7 @@ def page_compare(uid):
 
 # ---------- Auth UI (with 👁️ toggle & auto-login after signup) ----------
 def login_ui():
-    st.title("🍿 Multi-Domain Recommender (GNN)")
+    st.title(" Multi-Domain Recommender (GNN)")
     st.subheader("Sign in to continue")
 
     email = st.text_input("Email", key="auth_email", placeholder="you@example.com")
