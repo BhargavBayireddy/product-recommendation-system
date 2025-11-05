@@ -1,146 +1,166 @@
+# app.py
 from __future__ import annotations
-import json, os
-from typing import Any, Dict, List, Tuple
+import os
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
 import streamlit as st
 
-# Optional imports (we gate them so local fallback works without Firebase)
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-    import pyrebase
-except Exception:  # missing in local dev or before pip install
-    firebase_admin = None
-    firestore = None
-    pyrebase = None
+from firebase_init import (
+    login_email_password, signup_email_password,
+    ensure_user, add_interaction,
+    fetch_user_interactions, fetch_global_interactions,
+)
 
+from data_real import load_items  # your existing loader -> DataFrame with item_id,name,domain,category,mood,image_url,provider
+from recommender import hybrid_recommend, search_live
+import ui_texts as copy
 
-# -------------------- CONFIG --------------------
-def _read_secrets() -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None]:
-    wc_txt = st.secrets.get("FIREBASE_WEB_CONFIG")
-    sa_txt = st.secrets.get("FIREBASE_SERVICE_ACCOUNT")
-    if not wc_txt or not sa_txt:
-        return None, None
-    try:
-        web = json.loads(wc_txt) if isinstance(wc_txt, str) else wc_txt
-        sa  = json.loads(sa_txt) if isinstance(sa_txt, str) else sa_txt
-        # ensure databaseURL exists for pyrebase
-        if "databaseURL" not in web:
-            proj = web.get("projectId", "")
-            web["databaseURL"] = f"https://{proj}.firebaseio.com"
-        return web, sa
-    except Exception:
-        return None, None
+ARTIFACTS = Path("./artifacts")
 
+# ------------- UI helpers -------------
+def pill(txt): 
+    st.markdown(f"<span style='padding:2px 8px;border-radius:999px;background:#eee;font-size:12px'>{txt}</span>", unsafe_allow_html=True)
 
-WEB_CFG, SA_CFG = _read_secrets()
-USE_FIREBASE = bool(WEB_CFG and SA_CFG and firebase_admin and pyrebase)
+def card(item):
+    with st.container(border=True):
+        st.markdown(f"**{item['name']}**")
+        sub = f"{item.get('domain','')} · {item.get('category','')}"
+        st.caption(sub)
+        c1,c2,c3 = st.columns([1,1,1])
+        with c1:
+            if st.button("❤️ Like", key=f"like-{item['item_id']}"):
+                add_interaction(st.session_state["uid"], item["item_id"], "like")
+                st.toast("Saved to Likes")
+                st.rerun()
+        with c2:
+            if st.button("👜 Bag", key=f"bag-{item['item_id']}"):
+                add_interaction(st.session_state["uid"], item["item_id"], "bag")
+                st.toast("Added to Bag")
+                st.rerun()
+        with c3:
+            st.write(copy.pick_line())
 
-
-# -------------------- SINGLETONS --------------------
-_py_auth = None
-_db = None
-
-def _init_clients():
-    global _py_auth, _db
-    if not USE_FIREBASE:
+def grid(df: pd.DataFrame, columns: int = 5):
+    if df.empty:
+        st.info("Nothing to show yet.")
         return
-    # pyrebase (client auth)
-    fb = pyrebase.initialize_app(WEB_CFG)
-    _py_auth = fb.auth()
+    blocks = [st.columns(columns) for _ in range((len(df)+columns-1)//columns)]
+    i = 0
+    for row in blocks:
+        for col in row:
+            if i >= len(df): break
+            with col:
+                card(df.iloc[i])
+            i += 1
 
-    # admin + firestore
-    if not firebase_admin._apps:
-        cred = credentials.Certificate(SA_CFG)
-        firebase_admin.initialize_app(cred)
-    _db = firestore.client()
+# ------------- Auth Gate -------------
+def auth_gate():
+    st.title("Sign in to continue")
+    email = st.text_input("Email", key="email")
+    pwd = st.text_input("Password", type="password", key="pwd")
+    c1, c2 = st.columns(2)
+    err = st.empty()
 
+    if c1.button("Login", use_container_width=True):
+        try:
+            user = login_email_password(email, pwd)
+            st.session_state["uid"] = user["localId"]
+            ensure_user(user["localId"], email=email)
+            st.success("Welcome back!")
+            st.rerun()
+        except Exception as e:
+            err.error("Incorrect email or password.")
+    if c2.button("Create account", use_container_width=True):
+        try:
+            user = signup_email_password(email, pwd)
+            st.session_state["uid"] = user["localId"]
+            ensure_user(user["localId"], email=email)
+            st.success("Account created. You’re in!")
+            st.rerun()
+        except Exception as e:
+            # Hide raw API, keep friendly
+            err.error("That email looks taken. Try Login.")
 
-# -------------------- PUBLIC API --------------------
-def is_configured() -> bool:
-    return USE_FIREBASE
+# ------------- Pages -------------
+def page_home(items_df: pd.DataFrame):
+    # mood & copy
+    mood = copy.mood_label(datetime.now(), st.session_state.get("_keys", 0))
+    st.caption(copy.mood_copy(mood))
 
-def db_client():
-    """Firetore client or None if not available."""
-    if USE_FIREBASE and _db is None:
-        _init_clients()
-    return _db
+    # recommendations
+    user_hist = fetch_user_interactions(st.session_state["uid"], limit=300)
+    global_hist = fetch_global_interactions(limit=3000)
+    top, collab, explore, backend = hybrid_recommend(items_df, user_hist, global_hist, ARTIFACTS, k_return=48)
 
-def signup_email_password(email: str, password: str):
-    """Return (user_dict | None, error_msg | None)"""
-    if not USE_FIREBASE:
-        return None, "Firebase not configured"
-    try:
-        if _py_auth is None:
-            _init_clients()
-        user = _py_auth.create_user_with_email_and_password(email, password)
-        ensure_user(user["localId"], email=email)
-        return user, None
-    except Exception as e:
-        return None, str(e)
+    st.subheader("🔥 Top picks for you")
+    st.caption("If taste had a leaderboard, these would be S-tier 🏅")
+    grid(top)
 
-def login_email_password(email: str, password: str):
-    """Return (user_dict | None, error_msg | None)"""
-    if not USE_FIREBASE:
-        return None, "Firebase not configured"
-    try:
-        if _py_auth is None:
-            _init_clients()
-        user = _py_auth.sign_in_with_email_and_password(email, password)
-        ensure_user(user["localId"], email=email)
-        return user, None
-    except Exception as e:
-        return None, str(e)
+    st.subheader(copy.collab_header())
+    grid(collab)
 
-# -------- Firestore helpers (users + interactions + global feed) --------
-USERS_COLL = "users"
-USER_INTERACTIONS_SUB = "interactions"
-GLOBAL_INTERACTIONS = "interactions_global"
+    st.subheader(copy.explore_header())
+    grid(explore)
 
-def ensure_user(uid: str, email: str | None = None):
-    if not USE_FIREBASE: return
-    c = db_client()
-    if not c: return
-    doc = c.collection(USERS_COLL).document(uid).get()
-    if not doc.exists:
-        c.collection(USERS_COLL).document(uid).set({"uid": uid, "email": email or ""})
+def page_likes(items_df: pd.DataFrame):
+    st.subheader("❤️ Your Likes")
+    hist = fetch_user_interactions(st.session_state["uid"], limit=500)
+    liked = {x["item_id"] for x in hist if x.get("action")=="like"}
+    df = items_df[items_df["item_id"].isin(liked)]
+    grid(df)
 
-def add_interaction(uid: str, item_id: str, action: str):
-    """like/bag actions go to per-user AND global collection."""
-    if not USE_FIREBASE: return
-    c = db_client()
-    if not c: return
-    payload = firestore.SERVER_TIMESTAMP
-    # create map we can reuse
-    data = {"uid": uid, "item_id": item_id, "action": action, "ts": payload}
-    c.collection(USERS_COLL).document(uid).collection(USER_INTERACTIONS_SUB).add(data)
-    c.collection(GLOBAL_INTERACTIONS).add(data)
+def page_bag(items_df: pd.DataFrame):
+    st.subheader("👜 Your Bag")
+    hist = fetch_user_interactions(st.session_state["uid"], limit=500)
+    bagged = {x["item_id"] for x in hist if x.get("action")=="bag"}
+    df = items_df[items_df["item_id"].isin(bagged)]
+    grid(df)
 
-def remove_interaction(uid: str, item_id: str, action: str):
-    if not USE_FIREBASE: return
-    c = db_client()
-    if not c: return
-    # user scoped
-    q = (c.collection(USERS_COLL).document(uid)
-           .collection(USER_INTERACTIONS_SUB)
-           .where("item_id","==", item_id).where("action","==", action))
-    for d in q.stream(): d.reference.delete()
-    # global
-    g = (c.collection(GLOBAL_INTERACTIONS)
-           .where("uid","==", uid).where("item_id","==", item_id).where("action","==", action))
-    for d in g.stream(): d.reference.delete()
+def page_compare(items_df: pd.DataFrame):
+    st.subheader("⚔️ Model vs Model — Who recommends better?")
+    st.info("Coming soon: compare GNN vs Content vs Hybrid on your profile.")
 
-def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
-    if not USE_FIREBASE: return []
-    c = db_client()
-    if not c: return []
-    q = (c.collection(USERS_COLL).document(uid).collection(USER_INTERACTIONS_SUB)
-           .order_by("ts", direction=firestore.Query.DESCENDING).limit(limit))
-    return [d.to_dict() for d in q.stream() if d.to_dict()]
+# ------------- Main -------------
+def main():
+    st.set_page_config(page_title="Multi-Domain Recommender (GNN)", layout="wide")
+    # Live keystroke counter for mood
+    if "_keys" not in st.session_state: st.session_state["_keys"] = 0
 
-def fetch_global_interactions(limit: int = 4000) -> List[Dict[str, Any]]:
-    if not USE_FIREBASE: return []
-    c = db_client()
-    if not c: return []
-    q = (c.collection(GLOBAL_INTERACTIONS)
-           .order_by("ts", direction=firestore.Query.DESCENDING).limit(limit))
-    return [d.to_dict() for d in q.stream() if d.to_dict()]
+    if "uid" not in st.session_state:
+        auth_gate()
+        return
+
+    items_df = load_items()  # DataFrame with item_id, name, domain, category, mood, image_url, provider
+
+    # Sidebar
+    with st.sidebar:
+        st.success(f"Logged in: {st.session_state.get('email','') or '✅'}")
+        if st.button("Logout"):
+            for k in list(st.session_state.keys()):
+                if k not in ("_keys",): del st.session_state[k]
+            st.rerun()
+        page = st.radio("Go to", ["Home","Liked","Bag","Compare"], index=0)
+
+    # Netflix-style search (1-letter live)
+    q = st.text_input("🔎 Search anything (name, domain, category, mood)…", key="q", on_change=lambda: st.session_state.__setitem__("_keys", st.session_state.get("_keys",0)+1))
+    q = (q or "").strip()
+    if q:
+        res = search_live(items_df, q, limit=60)
+        st.subheader(f"Results for “{q}”")
+        grid(res)
+        st.caption("Clearing the search will bring you back home.")
+        return  # while searching we don’t render sections
+
+    # No query → regular pages
+    if page == "Home": 
+        page_home(items_df)
+    elif page == "Liked":
+        page_likes(items_df)
+    elif page == "Bag":
+        page_bag(items_df)
+    else:
+        page_compare(items_df)
+
+if __name__ == "__main__":
+    main()
