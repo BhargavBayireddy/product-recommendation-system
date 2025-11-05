@@ -29,7 +29,7 @@ try:
     from firebase_init import (
         signup_email_password, login_email_password,
         add_interaction, fetch_user_interactions, ensure_user,
-        remove_interaction
+        remove_interaction, fetch_global_interactions
     )
 except Exception:
     USE_FIREBASE = False
@@ -40,6 +40,19 @@ from gnn_infer import load_item_embeddings, make_user_vector
 # ---------- CSS ----------
 if CSS_FILE.exists():
     st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
+
+# ---------- Simple auto-refresh (5s) when enabled ----------
+def enable_auto_refresh(seconds=5):
+    """Try native helper if available; fallback to JS."""
+    try:
+        # optional dependency; if not installed, fallback to JS
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=seconds * 1000, key="auto-refresh-collab")
+    except Exception:
+        st.markdown(
+            f"<script>setTimeout(function(){{ window.location.reload(); }}, {int(seconds*1000)});</script>",
+            unsafe_allow_html=True,
+        )
 
 # ---------- Local fallback store ----------
 LOCAL_STORE = BASE / ".local_interactions.json"
@@ -140,6 +153,14 @@ def read_interactions(uid):
             out.append(r); seen.add(k)
     return out
 
+def read_global_interactions(limit=2000):
+    if not USE_FIREBASE:
+        return []
+    try:
+        return fetch_global_interactions(limit=limit)
+    except Exception:
+        return []
+
 # ---------- Recommendation helpers ----------
 def user_has_history(uid) -> bool:
     inter = read_interactions(uid)
@@ -152,18 +173,74 @@ def user_vector(uid):
 def score_items(uvec):
     return (ITEM_EMBS @ uvec.T).flatten()
 
-# --- collaborative row: users who liked same items ---
-def collaborative_candidates(uid, top_k=12):
-    inter = read_interactions(uid)
-    liked = {x["item_id"] for x in inter if x.get("action") == "like"}
-    if not liked:
+# --- AGGRESSIVE collaborative candidates (mode=3) ---
+def collaborative_candidates_aggressive(uid, top_k=12):
+    """
+    Find items liked by *any* other user who liked at least one item that this user liked.
+    Excludes items already liked/bagged by this user. Ranks by model score, then recency.
+    """
+    my = read_interactions(uid)
+    my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
+    if not my_likes:
         return pd.DataFrame()
-    df = ITEMS.copy()
+
+    global_events = read_global_interactions(limit=4000)  # recent global feed
+    if not global_events:
+        return pd.DataFrame()
+
+    # users who liked anything I liked (exclude me)
+    similar_user_ids = {
+        e["uid"] for e in global_events
+        if e.get("action") == "like" and e.get("item_id") in my_likes and e.get("uid") != uid
+    }
+
+    if not similar_user_ids:
+        return pd.DataFrame()
+
+    # items those users liked (aggressive: no threshold other than any overlap)
+    candidate_items = {
+        e["item_id"] for e in global_events
+        if e.get("action") == "like" and e.get("uid") in similar_user_ids
+    }
+
+    # exclude items I already liked/bagged
+    mine_all = {x["item_id"] for x in my if x.get("action") in ("like", "bag")}
+    candidate_items = [i for i in candidate_items if i not in mine_all]
+
+    if not candidate_items:
+        return pd.DataFrame()
+
+    df = ITEMS[ITEMS["item_id"].isin(candidate_items)].copy()
+    if df.empty:
+        return df
+
+    # rank by my model score + small recency boost from global feed
     uvec = user_vector(uid)
     scores = score_items(uvec)
-    df["score"] = scores
-    df = df[~df["item_id"].isin(liked)]
+    idx_series = df["item_id"].map(I2I)
+    df["score"] = scores.mean()
+    ok = idx_series.notna()
+    df.loc[ok, "score"] = scores[idx_series[ok].astype(int).to_numpy()]
+
+    # recency boost: newer global events -> slightly higher score
+    latest_ts = {}
+    for e in global_events:
+        if e.get("item_id") in candidate_items:
+            latest_ts[e["item_id"]] = max(latest_ts.get(e["item_id"], 0.0), _parse_ts(e.get("ts")))
+    rec = df["item_id"].map(lambda x: latest_ts.get(x, 0.0))
+    if not rec.isna().all():
+        rec_norm = (rec - rec.min()) / (rec.max() - rec.min() + 1e-9)
+        df["score"] = df["score"] + 0.05 * rec_norm  # tiny nudge
+
     return df.sort_values("score", ascending=False).head(top_k)
+
+def _parse_ts(ts_str):
+    try:
+        # ISO string -> epoch seconds (rough)
+        from datetime import datetime
+        return datetime.fromisoformat(ts_str.replace("Z","")).timestamp()
+    except Exception:
+        return 0.0
 
 def recommend(uid, k=48):
     if len(ITEMS) == 0:
@@ -175,14 +252,13 @@ def recommend(uid, k=48):
 
     idx_series = df["item_id"].map(I2I)
     mask = idx_series.notna().to_numpy()
-
     scores_aligned = np.full(len(df), float(scores.mean()), dtype=float)
     if mask.any():
         scores_aligned[mask] = scores[idx_series[mask].astype(int).to_numpy()]
     df["score"] = scores_aligned
 
-    top = df.sort_values("score", ascending=False)
-
+    # Baselines
+    top_all = df.sort_values("score", ascending=False)
     inter = read_interactions(uid)
     liked_ids = [x["item_id"] for x in inter if x.get("action")=="like"]
     liked_df = df[df["item_id"].isin(liked_ids)].copy()
@@ -195,7 +271,14 @@ def recommend(uid, k=48):
 
     explore = df.sort_values("score", ascending=True)
 
-    collab = collaborative_candidates(uid, 12)
+    # Aggressive collaborative row (first priority)
+    collab = collaborative_candidates_aggressive(uid, top_k=12)
+
+    # De-dup sections (collab shown first)
+    seen = set(collab["item_id"].tolist())
+    top = top_all[~top_all["item_id"].isin(seen)]
+    because = because[~because["item_id"].isin(seen)]
+    explore = explore[~explore["item_id"].isin(seen)]
 
     return (top.head(k),
             collab.head(12),
@@ -296,7 +379,6 @@ def compute_fast_metrics(uid):
         fresh = [d for d in doms if d not in liked_dom] if liked_dom else doms
         return float(len(fresh)/max(1,len(doms)))
     def _personalization(x):
-        import numpy as np
         rng = np.random.default_rng(99)
         other_u = ITEM_EMBS.mean(axis=0, keepdims=True) + rng.normal(0, 0.03, size=(1, ITEM_EMBS.shape[1]))
         other_scores = (ITEM_EMBS @ other_u.T).flatten()
@@ -385,11 +467,15 @@ def page_compare(uid):
                        xaxis_title="Milliseconds", yaxis_title="", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig3, use_container_width=True)
 
-    st.caption("These are fast, offline proxies so your demo is smooth. GNN optimizes novelty + personalization + accuracy while staying low-latency via cached embeddings.")
+    st.caption("Fast proxy metrics so your demo is smooth. GNN balances novelty + personalization + accuracy while staying low-latency via cached embeddings.")
 
 # ---------- Pages ----------
 def page_home():
-    st.caption(f"🧠 Backend: **{BACKEND}** · Fast, text-only tiles")
+    st.caption(f"🧠 Backend: **{BACKEND}** · Live collab on")
+    # Live auto-refresh toggle (default ON for aggressive mode)
+    live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
+    if live:
+        enable_auto_refresh(5)
 
     # 🔎 Search bar
     search = st.text_input("🔎 Search anything (name, domain, category, mood)...")
@@ -403,9 +489,11 @@ def page_home():
 
     top, collab, because, explore = recommend(st.session_state["uid"], k=48)
 
-    card_row(top.head(12), "top", "🔥 Top picks for you", "If taste had a leaderboard, these would be S-tier 🏅", True)
+    # Aggressive: show collaborative row FIRST if available
     if not collab.empty:
         card_row(collab, "collab", "👀 People who vibe like you couldn't resist these…", "", True)
+
+    card_row(top.head(12), "top", "🔥 Top picks for you", "If taste had a leaderboard, these would be S-tier 🏅", True)
     card_row(because.head(12), "because", "🎧 Because you liked…", "More of what matched your vibe 😎", True)
     card_row(explore.head(12), "explore", "🧭 Explore something different", "Happy accidents live here 🌿", False)
 
