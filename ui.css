@@ -1,53 +1,117 @@
-/* --- Global background --- */
-.stApp {
-    background: #ffffff;
+/* ui.css (enhanced floating, motion background, Netflix‑style hero) */
+:root {
+  --nf: #ff6b6b;
+  --az: #ff922b;
+  --sp: #2ecc71;
+  --ink: #111;
+  --muted: #666;
+  --pill: #ffffffcc;
+}
+html, body {
+  background: radial-gradient(1200px 800px at 10% 10%, #0e0d13 0%, #0b0a10 35%, #09080e 60%, #07060c 85%) !important;
+  color: #f5f7fb;
 }
 
-/* --- Card layout --- */
-.card {
-    min-width: 220px;
-    max-width: 240px;
-    border-radius: 16px;
-    padding: .75rem;
-    border: 1px solid #e5e7eb;
-    color: #1b1f24;
-    font-family: "Inter", sans-serif;
+/* Floating nebula */
+.hero { position: fixed; inset: -40px -40px auto -40px; height: 60vh; z-index: -1; filter: blur(24px) saturate(110%); }
+.float-a, .float-b, .float-c {
+  position: absolute; width: 420px; height: 420px; border-radius: 50%;
+  opacity: .4; mix-blend-mode: screen;
+  animation: float 22s ease-in-out infinite alternate;
+}
+.float-a { left: 10%; top: 10%; background: radial-gradient(circle at 30% 30%, #e50914 0%, #69101a 70%); }
+.float-b { right: 8%; top: 5%; background: radial-gradient(circle at 70% 40%, #1db954 0%, #133f2a 70%); animation-delay: -7s; }
+.float-c { left: 35%; top: -4%; background: radial-gradient(circle at 60% 40%, #edb74a 0%, #6b4d1a 70%); animation-delay: -12s; }
+@keyframes float {
+  0%   { transform: translate(0, 0) scale(1.0) rotate(0deg); }
+  100% { transform: translate(20px, -14px) scale(1.05) rotate(4deg); }
 }
 
-/* --- CARD COLOR BY DOMAIN --- */
-.card.nf { background: #ffecec; border-color: #ffb3b3; }   /* Netflix red tint */
-.card.sp { background: #e9fbf0; border-color: #9be6b7; }   /* Spotify green tint */
-.card.az { background: #fff4e0; border-color: #ffc88a; }   /* Amazon orange tint */
-
-/* --- ITEM NAME BOX --- */
-.card .name {
-    height: 115px;
-    border-radius: 12px;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    font-weight:700;
-    color:#1b1f24;
-    text-align:center;
-    padding:0 .25rem;
+/* Row titles */
+.rowtitle {
+  font-size: 20px;
+  font-weight: 800;
+  margin: 14px 2px 4px 2px;
+}
+.subtitle {
+  color: #b7b7c2;
+  margin-bottom: 8px;
 }
 
-/* --- Pills --- */
-.pill {
-    padding:.15rem .45rem;
-    border-radius:999px;
-    font-size:.75rem;
-    font-weight:600;
-}
-.pill.nf { background:#ffefef; color:#e50914; }
-.pill.az { background:#fff4e0; color:#ff9900; }
-.pill.sp { background:#e6faef; color:#1db954; }
-
-/* --- Text meta --- */
-.cap { color:#6b7280; font-size:.85rem; margin-top:.35rem; }
-.tagline { color:#374151; font-size:.9rem; margin:.3rem 0 .35rem; }
-
-/* Scroll row */
+/* Grid */
 .scroller {
-    display:flex; gap:.75rem; overflow:auto; padding-bottom:.5rem;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
 }
+
+/* Cards */
+.card.textonly {
+  padding: 14px 14px 12px 14px;
+  border-radius: 16px;
+  color: #0b0b10;
+  box-shadow: 0 2px 16px rgba(0,0,0,.25);
+  min-height: 134px;
+  background: #e9ecef;
+}
+.card.textonly.nf { background: var(--nf); color: #081018; }
+.card.textonly.az { background: var(--az); color: #081018; }
+.card.textonly.sp { background: var(--sp); color: #081018; }
+.card.textonly.xx { background: #e9ecef; }
+
+.card .name {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.2;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+.card .cap {
+  font-size: 12px;
+  color: #111;
+  margin-bottom: 8px;
+}
+.card .tagline {
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  opacity: .95;
+}
+
+/* Domain pills */
+.pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--pill);
+  border: 1px solid rgba(255,255,255,.08);
+  font-size: 11px;
+  font-weight: 800;
+  margin-left: 6px;
+}
+.pill.nf { color: #e50914; }
+.pill.az { color: #c96f00; }
+.pill.sp { color: #1db954; }
+
+/* Spacing */
+.blockpad { height: 16px; }
+
+/* Buttons — subtle glass */
+.stButton > button {
+  background: rgba(255,255,255,.08) !important;
+  color: #f5f7fb !important;
+  border: 1px solid rgba(255,255,255,.18) !important;
+  border-radius: 12px !important;
+  padding: 8px 12px !important;
+  font-weight: 800 !important;
+  box-shadow: 0 6px 18px rgba(0,0,0,.25) !important;
+  backdrop-filter: blur(6px);
+}
+.stButton > button:hover { filter: brightness(1.1); }
+
+/* Sidebar */
+.sidebar .stRadio, .stRadio, .stSelectbox { background: transparent !important; }
+[data-testid="stSidebarContent"] { background: rgba(0,0,0,.25); }
+
+/* Plotly containers */
+.css-1dp5vir, .css-ocqkz7, .stPlotlyChart { background: transparent !important; }
