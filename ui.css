@@ -1,58 +1,42 @@
-/* ui.css (enhanced floating, motion background, Netflix‑style hero) */
+/* Page base */
 :root {
-  --nf: #ff6b6b;
-  --az: #ff922b;
-  --sp: #2ecc71;
+  --nf: #ff6b6b;      /* Netflix pastel red */
+  --az: #ff922b;      /* Amazon pastel orange */
+  --sp: #2ecc71;      /* Spotify pastel green */
   --ink: #111;
   --muted: #666;
   --pill: #ffffffcc;
 }
 html, body {
-  background: radial-gradient(1200px 800px at 10% 10%, #0e0d13 0%, #0b0a10 35%, #09080e 60%, #07060c 85%) !important;
-  color: #f5f7fb;
-}
-
-/* Floating nebula */
-.hero { position: fixed; inset: -40px -40px auto -40px; height: 60vh; z-index: -1; filter: blur(24px) saturate(110%); }
-.float-a, .float-b, .float-c {
-  position: absolute; width: 420px; height: 420px; border-radius: 50%;
-  opacity: .4; mix-blend-mode: screen;
-  animation: float 22s ease-in-out infinite alternate;
-}
-.float-a { left: 10%; top: 10%; background: radial-gradient(circle at 30% 30%, #e50914 0%, #69101a 70%); }
-.float-b { right: 8%; top: 5%; background: radial-gradient(circle at 70% 40%, #1db954 0%, #133f2a 70%); animation-delay: -7s; }
-.float-c { left: 35%; top: -4%; background: radial-gradient(circle at 60% 40%, #edb74a 0%, #6b4d1a 70%); animation-delay: -12s; }
-@keyframes float {
-  0%   { transform: translate(0, 0) scale(1.0) rotate(0deg); }
-  100% { transform: translate(20px, -14px) scale(1.05) rotate(4deg); }
+  background: #fff !important;
+  color: var(--ink);
 }
 
 /* Row titles */
 .rowtitle {
   font-size: 20px;
-  font-weight: 800;
-  margin: 14px 2px 4px 2px;
+  font-weight: 700;
+  margin: 6px 2px 2px 2px;
 }
 .subtitle {
-  color: #b7b7c2;
+  color: var(--muted);
   margin-bottom: 8px;
 }
 
-/* Grid */
+/* Horizontal scroller */
 .scroller {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
 }
 
-/* Cards */
+/* Cards (text only) */
 .card.textonly {
   padding: 14px 14px 12px 14px;
-  border-radius: 16px;
-  color: #0b0b10;
-  box-shadow: 0 2px 16px rgba(0,0,0,.25);
-  min-height: 134px;
-  background: #e9ecef;
+  border-radius: 14px;
+  color: #111;
+  box-shadow: 0 2px 10px rgba(0,0,0,.08);
+  min-height: 130px;
 }
 .card.textonly.nf { background: var(--nf); color: #081018; }
 .card.textonly.az { background: var(--az); color: #081018; }
@@ -73,7 +57,7 @@ html, body {
 }
 .card .tagline {
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   margin-bottom: 10px;
   opacity: .95;
 }
@@ -84,34 +68,38 @@ html, body {
   padding: 2px 8px;
   border-radius: 999px;
   background: var(--pill);
-  border: 1px solid rgba(255,255,255,.08);
+  border: 1px solid rgba(0,0,0,.08);
   font-size: 11px;
-  font-weight: 800;
+  font-weight: 700;
   margin-left: 6px;
 }
 .pill.nf { color: #e50914; }
 .pill.az { color: #c96f00; }
 .pill.sp { color: #1db954; }
 
-/* Spacing */
-.blockpad { height: 16px; }
+/* Spacing after rows */
+.blockpad { height: 14px; }
 
-/* Buttons — subtle glass */
+/* Buttons look white (fix black buttons) */
 .stButton > button {
-  background: rgba(255,255,255,.08) !important;
-  color: #f5f7fb !important;
-  border: 1px solid rgba(255,255,255,.18) !important;
-  border-radius: 12px !important;
-  padding: 8px 12px !important;
-  font-weight: 800 !important;
-  box-shadow: 0 6px 18px rgba(0,0,0,.25) !important;
-  backdrop-filter: blur(6px);
+  background: #fff !important;
+  color: var(--ink) !important;
+  border: 1px solid rgba(0,0,0,.15) !important;
+  border-radius: 10px !important;
+  padding: 6px 10px !important;
+  font-weight: 700 !important;
+  box-shadow: 0 1px 6px rgba(0,0,0,.06) !important;
 }
-.stButton > button:hover { filter: brightness(1.1); }
+.stButton > button:hover {
+  filter: brightness(0.98);
+}
 
-/* Sidebar */
-.sidebar .stRadio, .stRadio, .stSelectbox { background: transparent !important; }
-[data-testid="stSidebarContent"] { background: rgba(0,0,0,.25); }
+/* Sidebar radio / widgets — white */
+.css-1cypcdb, .sidebar .stRadio, .stRadio, .stSelectbox {
+  background: transparent !important;
+}
 
-/* Plotly containers */
-.css-1dp5vir, .css-ocqkz7, .stPlotlyChart { background: transparent !important; }
+/* Plotly white theme already set in code; ensure container is white */
+.css-1dp5vir, .css-ocqkz7, .stPlotlyChart {
+  background: #fff !important;
+}
