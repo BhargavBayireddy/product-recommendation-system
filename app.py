@@ -1,5 +1,5 @@
-    # app.py (enhanced)
-import os, json, time, hashlib, re
+# app.py
+import os, json, time, hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List
@@ -9,7 +9,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="DesiGraph — Culture‑Adaptive Recommender", layout="wide")
+st.set_page_config(page_title="Multi-Domain Recommender", layout="wide")
 
 # -------------------- Optional .env --------------------
 try:
@@ -27,7 +27,6 @@ CSS_FILE  = BASE / "ui.css"
 
 # -------------------- Firebase (REQUIRED) --------------------
 USE_FIREBASE = True
-PHONE_UI_ENABLED = False  # True only when you have Firebase Phone Auth + reCAPTCHA wired in frontend
 try:
     from firebase_init import (
         signup_email_password, login_email_password,
@@ -40,7 +39,6 @@ except Exception as e:
 
 # -------------------- Embeddings / GNN --------------------
 from gnn_infer import load_item_embeddings, make_user_vector
-from quanta import quanta_rank  # NEW: QuantaGNN hybrid ranker
 
 # -------------------- CSS --------------------
 if CSS_FILE.exists():
@@ -52,6 +50,7 @@ def enable_auto_refresh(seconds=5):
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=seconds * 1000, key="auto-refresh-collab")
     except Exception:
+        # Vanilla fallback
         st.markdown(
             f"<script>setTimeout(function(){{window.location.reload();}}, {int(seconds*1000)});</script>",
             unsafe_allow_html=True,
@@ -166,42 +165,94 @@ def read_global_interactions(limit=2000):
     except Exception:
         return []
 
-# -------------------- QuantaGNN Recommender --------------------
+# -------------------- Reco helpers --------------------
+def user_has_history(uid) -> bool:
+    inter = read_interactions(uid)
+    return any(a.get("action") in ("like","bag") for a in inter)
+
+def user_vector(uid):
+    inter = read_interactions(uid)
+    return make_user_vector(interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS)
+
+def score_items(uvec):
+    return (ITEM_EMBS @ uvec.T).flatten()
+
 def _parse_ts(ts_str):
     try:
         return datetime.fromisoformat(str(ts_str).replace("Z","")).timestamp()
     except Exception:
         return 0.0
 
+def collaborative_candidates_aggressive(uid, top_k=12):
+    """
+    If I liked A and other users also liked A, recommend whatever else they liked.
+    SHOW ALL (even if I already liked it). Ranked by my score + small recency boost.
+    """
+    my = read_interactions(uid)
+    my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
+    if not my_likes:
+        return pd.DataFrame()
+
+    global_events = read_global_interactions(limit=4000)
+    if not global_events:
+        return pd.DataFrame()
+
+    similar_uids = {
+        e.get("uid") for e in global_events
+        if e.get("action") == "like" and e.get("item_id") in my_likes and e.get("uid") != uid
+    }
+    if not similar_uids:
+        return pd.DataFrame()
+
+    candidate_items = {
+        e.get("item_id") for e in global_events
+        if e.get("action") == "like" and e.get("uid") in similar_uids
+    }
+    if not candidate_items:
+        return pd.DataFrame()
+
+    df = ITEMS[ITEMS["item_id"].isin(candidate_items)].copy()
+    if df.empty:
+        return df
+
+    uvec = user_vector(uid)
+    scores = score_items(uvec)
+    idx_series = df["item_id"].map(I2I)
+    df["score"] = scores.mean()
+    ok = idx_series.notna()
+    df.loc[ok, "score"] = scores[idx_series[ok].astype(int).to_numpy()]
+
+    latest_ts = {}
+    cand_set = set(candidate_items)
+    for e in global_events:
+        iid = e.get("item_id")
+        if iid in cand_set:
+            latest_ts[iid] = max(latest_ts.get(iid, 0.0), _parse_ts(e.get("ts")))
+    rec = df["item_id"].map(lambda x: latest_ts.get(x, 0.0))
+    if not rec.isna().all():
+        rec_norm = (rec - rec.min()) / (rec.max() - rec.min() + 1e-9)
+        df["score"] = df["score"] + 0.05 * rec_norm
+
+    return df.sort_values("score", ascending=False).head(top_k)
+
 def recommend(uid, k=48):
-    """
-    Hybrid scoring:
-      raw = cosine(user_vec, item_emb)
-      quanta = novelty/diversity/recency/culture-aware boosts (from quanta.quanta_rank)
-      final = 0.82*raw + 0.18*quanta
-    """
     if len(ITEMS) == 0:
         return ITEMS.copy(), ITEMS.copy(), ITEMS.copy(), ITEMS.copy()
 
-    inter = read_interactions(uid)
-    uvec = make_user_vector(interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS)
-    raw_scores = (ITEM_EMBS @ uvec.T).flatten()
-
+    u = user_vector(uid)
+    scores = score_items(u)
     df = ITEMS.copy()
+
     idx_series = df["item_id"].map(I2I)
     mask = idx_series.notna().to_numpy()
-    raw_aligned = np.full(len(df), float(raw_scores.mean()), dtype=float)
+    scores_aligned = np.full(len(df), float(scores.mean()), dtype=float)
     if mask.any():
-        raw_aligned[mask] = raw_scores[idx_series[mask].astype(int).to_numpy()]
-    df["raw_score"] = raw_aligned
-
-    # QuantaGNN re-ranker
-    quanta = quanta_rank(df=df, interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS, global_events=read_global_interactions())
-    df["quanta"] = quanta
-    df["score"] = 0.82*df["raw_score"] + 0.18*df["quanta"]
+        scores_aligned[mask] = scores[idx_series[mask].astype(int).to_numpy()]
+    df["score"] = scores_aligned
 
     top_all = df.sort_values("score", ascending=False)
 
+    inter = read_interactions(uid)
     liked_ids = [x["item_id"] for x in inter if x.get("action")=="like"]
     liked_df = df[df["item_id"].isin(liked_ids)].copy()
     because = df.copy()
@@ -210,11 +261,11 @@ def recommend(uid, k=48):
         because = df[df["domain"].isin(doms)] if doms else df
     because = because.sort_values("score", ascending=False)
 
-    # explore is the "long-tail" opposite of top picks to fight filter-bubbles
-    explore = df.sort_values("quanta", ascending=True)
+    explore = df.sort_values("score", ascending=True)
 
-    # quick collab lookalikes (kept as-is from baseline for now)
-    collab = df.sort_values("quanta", ascending=False).head(12)
+    collab = collaborative_candidates_aggressive(uid, top_k=12)
+    if collab is None or collab.empty or "item_id" not in collab.columns:
+        collab = pd.DataFrame(columns=["item_id","name","domain","category","mood","goal","score"])
 
     return (top_all.head(k),
             collab.head(12),
@@ -271,6 +322,7 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
             if c2.button("🛍️ Add to Bag", key=bg):
                 save_interaction(st.session_state["uid"], row["item_id"], "bag"); st.rerun()
             if allow_remove:
+                # default to 'like' if not specified (liked page) or 'bag' in bag page where we set action=bag
                 act = row.get("action","like")
                 if c3.button("🗑 Remove", key=rm):
                     delete_interaction(st.session_state["uid"], row["item_id"], act); st.rerun()
@@ -282,7 +334,7 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
 # -------------------- Compare page --------------------
 def compute_fast_metrics(uid):
     df = ITEMS.copy()
-    u = make_user_vector(interactions=read_interactions(uid), iid2idx=I2I, item_embs=ITEM_EMBS)
+    u = user_vector(uid)
     scores = (ITEM_EMBS @ u.T).flatten()
     idx = df["item_id"].map(I2I).astype("Int64")
     ok = idx.notna()
@@ -375,11 +427,12 @@ def page_compare(uid):
 
 # -------------------- Pages --------------------
 def page_home():
-    st.caption(f"🧠 Backend: **{BACKEND} + QuantaGNN** · Live collab on")
+    st.caption(f"🧠 Backend: **{BACKEND}** · Live collab on")
     live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
     if live:
         enable_auto_refresh(5)
 
+    # Search first
     q = st.text_input("🔎 Search anything (name, domain, category, mood)...").strip()
     if q:
         qlow = q.lower()
@@ -392,12 +445,15 @@ def page_home():
 
     top, collab, because, explore = recommend(st.session_state["uid"], k=48)
 
+    # Top picks
     card_row(top.head(12), "top", "🔥 Top picks for you",
-             "Culture‑aware. Trend‑aware. Fit‑aware.", True)
+             "If taste had a leaderboard, these would be S-tier 🏅", True)
 
-    if collab is not None and len(collab) > 0:
-        card_row(collab, "collab", "🔥 Your vibe‑twins also loved…", show_cheese=True)
+    # Vibe-twins after top
+    if not collab.empty:
+        card_row(collab, "collab", "🔥 Your vibe-twins also loved…", show_cheese=True)
 
+    # Explore
     card_row(explore.head(12), "explore", "🧭 Explore something different",
              "Happy accidents live here 🌿", False)
 
@@ -426,6 +482,7 @@ def page_bag():
 # -------------------- Auth & Login --------------------
 def _parse_firebase_error(msg: str) -> str:
     s = str(msg)
+    # common pyrebase error substrings
     if "EMAIL_NOT_FOUND" in s or "user record" in s:
         return "not_found"
     if "INVALID_PASSWORD" in s or "INVALID_LOGIN_CREDENTIALS" in s:
@@ -437,10 +494,7 @@ def _parse_firebase_error(msg: str) -> str:
     return "generic"
 
 def login_ui():
-    st.markdown('<div class="hero"><div class="float-a"></div><div class="float-b"></div><div class="float-c"></div></div>', unsafe_allow_html=True)
-    st.title("🎬 DesiGraph")
-    st.caption("Netflix‑style gated access · Sign in to continue")
-
+    st.title("🍿 Multi-Domain Recommender (GNN)")
     if not USE_FIREBASE:
         st.error("This deployment requires Firebase. Import failed.\n\n" +
                  "Please ensure Streamlit **Secrets** contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
@@ -448,64 +502,48 @@ def login_ui():
             st.code(FB_IMPORT_ERR)
         st.stop()
 
-    tab1, tab2 = st.tabs(["Email / Password", "Phone (OTP)"])
-
-    with tab1:
-        email = st.text_input("Email (use Gmail for best experience)")
-        pwd   = st.text_input("Password", type="password")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Sign in", use_container_width=True, type="primary"):
-                if not email or not pwd:
-                    st.warning("Email and password required.")
-                else:
-                    try:
-                        user = login_email_password(email, pwd)
-                        st.session_state["uid"] = user["localId"]
-                        st.session_state["email"] = email
-                        ensure_user(st.session_state["uid"], email=email)
-                        st.rerun()
-                    except Exception as e:
-                        kind = _parse_firebase_error(str(e))
-                        if kind == "not_found":
-                            st.error("Account not found. Please create one.")
-                        elif kind == "bad_password":
-                            st.error("Incorrect password. Try again.")
-                        elif kind == "rate_limited":
-                            st.error("Too many attempts. Try later.")
-                        elif kind == "disabled":
-                            st.error("This account is disabled.")
-                        else:
-                            st.error(f"Login failed. {e}")
-        with c2:
-            if st.button("Create account", use_container_width=True):
-                if not email or not pwd:
-                    st.warning("Enter email & password, then click Create account.")
-                else:
-                    try:
-                        signup_email_password(email, pwd)
-                        st.success("Account created. Now click **Sign in**.")
-                    except Exception as e:
-                        st.error(f"Signup failed: {e}")
-
-    with tab2:
-        st.info("⚠ Phone/SMS OTP requires Firebase Phone Auth + reCAPTCHA (browser).")
-        st.write("• Enable **Phone** sign‑in method in Firebase Auth.")
-        st.write("• Add a lightweight web widget for reCAPTCHA verifier and pass the custom token back.")
-        st.write("• Once wired, toggle PHONE_UI_ENABLED=True and expose `login_phone_otp()` in firebase_init.py.")
-        if PHONE_UI_ENABLED:
-            phone = st.text_input("Mobile number (+91...)")
-            otp = st.text_input("OTP", type="password")
-            if st.button("Verify & Sign in", type="primary"):
-                st.error("Implement firebase phone credential exchange here.")
-        else:
-            st.caption("For now, use Email/Password above.")
+    st.subheader("Sign in to continue")
+    email = st.text_input("Email")
+    pwd   = st.text_input("Password", type="password")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Sign in", use_container_width=True, type="primary"):
+            if not email or not pwd:
+                st.warning("Email and password required.")
+            else:
+                try:
+                    user = login_email_password(email, pwd)
+                    st.session_state["uid"] = user["localId"]
+                    st.session_state["email"] = email
+                    ensure_user(st.session_state["uid"], email=email)
+                    st.rerun()
+                except Exception as e:
+                    kind = _parse_firebase_error(str(e))
+                    if kind == "not_found":
+                        st.error("Account not found. Please create one.")
+                    elif kind == "bad_password":
+                        st.error("Incorrect password. Try again.")
+                    elif kind == "rate_limited":
+                        st.error("Too many attempts. Try later.")
+                    elif kind == "disabled":
+                        st.error("This account is disabled.")
+                    else:
+                        st.error(f"Login failed. {e}")
+    with c2:
+        if st.button("Create account", use_container_width=True):
+            if not email or not pwd:
+                st.warning("Enter email & password, then click Create account.")
+            else:
+                try:
+                    signup_email_password(email, pwd)
+                    st.success("Account created. Now click **Sign in**.")
+                except Exception as e:
+                    st.error(f"Signup failed: {e}")
 
     st.caption("No guest access. You must sign in to view recommendations.")
 
 # -------------------- Main --------------------
 def main():
-    # Netflix‑style forced login
     if "uid" not in st.session_state:
         login_ui(); return
 
