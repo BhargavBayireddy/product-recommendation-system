@@ -7,3 +7,4 @@ pandas
 python-dotenv
 pyrebase4
 firebase-admin
+setuptools
