@@ -24,6 +24,8 @@ ART.mkdir(exist_ok=True)
 
 ITEMS_CSV = ART / "items_snapshot.csv"
 CSS_FILE  = BASE / "ui.css"
+
+# ✅ Inject CSS only once
 if CSS_FILE.exists():
     st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
 
@@ -42,10 +44,6 @@ except Exception as e:
 # -------------------- Embeddings / GNN --------------------
 from gnn_infer import load_item_embeddings, make_user_vector
 
-# -------------------- CSS --------------------
-if CSS_FILE.exists():
-    st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
-
 # -------------------- Auto refresh --------------------
 def enable_auto_refresh(seconds=5):
     try:
@@ -57,7 +55,7 @@ def enable_auto_refresh(seconds=5):
             unsafe_allow_html=True,
         )
 
-# -------------------- Local fallback store (if Firebase write fails) --------------------
+# -------------------- Local fallback store --------------------
 LOCAL_STORE = BASE / ".local_interactions.json"
 
 def _local_write(uid, item_id, action):
@@ -80,8 +78,7 @@ def _local_delete(uid, item_id, action):
     LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 def _local_read(uid):
-    if not LOCAL_STORE.exists():
-        return []
+    if not LOCAL_STORE.exists(): return []
     try:
         data = json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}")
         return data.get(uid, [])
@@ -91,8 +88,7 @@ def _local_read(uid):
 # -------------------- Data bootstrap --------------------
 @st.cache_data
 def _build_items_if_missing():
-    if ITEMS_CSV.exists():
-        return
+    if ITEMS_CSV.exists(): return
     try:
         import data_real
         data_real.build()
@@ -159,14 +155,13 @@ def read_interactions(uid):
     return out
 
 def read_global_interactions(limit=2000):
-    if not USE_FIREBASE:
-        return []
+    if not USE_FIREBASE: return []
     try:
         return fetch_global_interactions(limit=limit)
     except Exception:
         return []
 
-# -------------------- Reco helpers --------------------
+# -------------------- Recommendation helpers --------------------
 def user_has_history(uid) -> bool:
     inter = read_interactions(uid)
     return any(a.get("action") in ("like","bag") for a in inter)
@@ -185,36 +180,27 @@ def _parse_ts(ts_str):
         return 0.0
 
 def collaborative_candidates_aggressive(uid, top_k=12):
-    """
-    If I liked A and other users also liked A, recommend whatever else they liked.
-    SHOW ALL (even if I already liked it). Ranked by my score + small recency boost.
-    """
     my = read_interactions(uid)
     my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
-    if not my_likes:
-        return pd.DataFrame()
+    if not my_likes: return pd.DataFrame()
 
     global_events = read_global_interactions(limit=4000)
-    if not global_events:
-        return pd.DataFrame()
+    if not global_events: return pd.DataFrame()
 
     similar_uids = {
         e.get("uid") for e in global_events
         if e.get("action") == "like" and e.get("item_id") in my_likes and e.get("uid") != uid
     }
-    if not similar_uids:
-        return pd.DataFrame()
+    if not similar_uids: return pd.DataFrame()
 
     candidate_items = {
         e.get("item_id") for e in global_events
         if e.get("action") == "like" and e.get("uid") in similar_uids
     }
-    if not candidate_items:
-        return pd.DataFrame()
+    if not candidate_items: return pd.DataFrame()
 
     df = ITEMS[ITEMS["item_id"].isin(candidate_items)].copy()
-    if df.empty:
-        return df
+    if df.empty: return df
 
     uvec = user_vector(uid)
     scores = score_items(uvec)
@@ -307,7 +293,6 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
             dom_class = "nf" if row["domain"]=="netflix" else ("az" if row["domain"]=="amazon" else ("sp" if row["domain"]=="spotify" else "xx"))
             st.markdown(f'<div class="card textonly {dom_class}">', unsafe_allow_html=True)
 
-            # IMAGE SLOT (thumbnail placeholder – text only in this build)
             st.markdown(f'<div class="name">{row["name"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
 
@@ -426,60 +411,6 @@ def page_compare(uid):
                        xaxis_title="Milliseconds", yaxis_title="", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig3, use_container_width=True)
 
-# -------------------- Pages --------------------
-def page_home():
-    st.caption(f"Backend: {BACKEND} · Live collab on")
-    live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
-    if live:
-        enable_auto_refresh(5)
-
-    # Search first
-    q = st.text_input("Search anything (name, domain, category, mood)...").strip()
-    if q:
-        qlow = q.lower()
-        res = ITEMS[ITEMS.apply(lambda r: qlow in str(r).lower(), axis=1)]
-        if len(res) == 0:
-            st.warning("No matches found.")
-        else:
-            card_row(res.head(24), "search", f"Search results for '{q}'")
-            st.divider()
-
-    top, collab, because, explore = recommend(st.session_state["uid"], k=48)
-
-    # Top picks
-    card_row(top.head(12), "top", "Top picks for you",
-             "If taste had a leaderboard, these would be S-tier", True)
-
-    # Vibe-twins after top
-    if not collab.empty:
-        card_row(collab, "collab", "People like you also loved…", show_cheese=True)
-
-    # Explore
-    card_row(explore.head(12), "explore", "Explore something different",
-             "Happy accidents live here", False)
-
-def page_liked():
-    st.header("Your Likes")
-    inter = read_interactions(st.session_state["uid"])
-    liked_ids = [x["item_id"] for x in inter if x.get("action") == "like"]
-    if not liked_ids:
-        st.info("No likes yet.")
-        return
-    df = ITEMS[ITEMS["item_id"].isin(liked_ids)].copy()
-    df["action"] = "like"
-    card_row(df.head(24), "liked", "Your like list", allow_remove=True)
-
-def page_bag():
-    st.header("Your Bag")
-    inter = read_interactions(st.session_state["uid"])
-    bag_ids = [x["item_id"] for x in inter if x.get("action") == "bag"]
-    if not bag_ids:
-        st.info("Your bag is empty.")
-        return
-    df = ITEMS[ITEMS["item_id"].isin(bag_ids)].copy()
-    df["action"] = "bag"
-    card_row(df.head(24), "bag", "Saved for later", allow_remove=True)
-
 # -------------------- Auth & Login --------------------
 def _parse_firebase_error(msg: str) -> str:
     s = str(msg)
@@ -520,16 +451,12 @@ def login_ui():
                 st.warning("Email and password required.")
             else:
                 try:
-                    
                     raw = login_email_password(email, pwd)
-                    user = json.loads(json.dumps(raw))  # ✅ Fix AttrDict
+                    user = json.loads(json.dumps(raw))  # ✅ Fix AttrDict to JSON
                     st.session_state["uid"] = user["localId"]
                     st.session_state["email"] = email
                     ensure_user(st.session_state["uid"], email=email)
                     st.rerun()
-                except Exception as e:
-                     st.error(str(e))
-
                 except Exception as e:
                     kind = _parse_firebase_error(str(e))
                     if kind == "not_found":
@@ -554,6 +481,56 @@ def login_ui():
                     st.error(f"Signup failed: {e}")
 
     st.caption("No guest access. You must sign in to view recommendations.")
+
+# -------------------- Pages --------------------
+def page_home():
+    st.caption(f"Backend: {BACKEND} · Live collab on")
+    live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
+    if live:
+        enable_auto_refresh(5)
+
+    q = st.text_input("Search anything (name, domain, category, mood)...").strip()
+    if q:
+        qlow = q.lower()
+        res = ITEMS[ITEMS.apply(lambda r: qlow in str(r).lower(), axis=1)]
+        if len(res) == 0:
+            st.warning("No matches found.")
+        else:
+            card_row(res.head(24), "search", f"Search results for '{q}'")
+            st.divider()
+
+    top, collab, because, explore = recommend(st.session_state["uid"], k=48)
+
+    card_row(top.head(12), "top", "Top picks for you",
+             "If taste had a leaderboard, these would be S-tier", True)
+
+    if not collab.empty:
+        card_row(collab, "collab", "People like you also loved…", show_cheese=True)
+
+    card_row(explore.head(12), "explore", "Explore something different",
+             "Happy accidents live here", False)
+
+def page_liked():
+    st.header("Your Likes")
+    inter = read_interactions(st.session_state["uid"])
+    liked_ids = [x["item_id"] for x in inter if x.get("action") == "like"]
+    if not liked_ids:
+        st.info("No likes yet.")
+        return
+    df = ITEMS[ITEMS["item_id"].isin(liked_ids)].copy()
+    df["action"] = "like"
+    card_row(df.head(24), "liked", "Your like list", allow_remove=True)
+
+def page_bag():
+    st.header("Your Bag")
+    inter = read_interactions(st.session_state["uid"])
+    bag_ids = [x["item_id"] for x in inter if x.get("action") == "bag"]
+    if not bag_ids:
+        st.info("Your bag is empty.")
+        return
+    df = ITEMS[ITEMS["item_id"].isin(bag_ids)].copy()
+    df["action"] = "bag"
+    card_row(df.head(24), "bag", "Saved for later", allow_remove=True)
 
 # -------------------- Main --------------------
 def main():
