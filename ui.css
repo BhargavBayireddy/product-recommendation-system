@@ -1,91 +1,177 @@
-/* ui.css — ReccoVerse Netflix-style */
+/* ================================
+   ReccoVerse UI – LEVEL 2 CINEMATIC MODE
+   ================================ */
 
-/* Theme tokens */
-:root{
-  --nf: #e50914;
-  --az: #ff9900;
-  --sp: #1DB954;
-  --ink: #eee;
-  --muted: #9aa0a6;
-  --bg0: #0b0b0e;
-  --bg1: #121218;
-  --card: #15151f;
-  --ring: #262631;
+/* --- GLOBAL DARK CANVAS --- */
+html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"] {
+  background: #050509 !important;
+  color: #e9e9ec !important;
+  overflow-x: hidden !important;
 }
 
-/* Global */
-html, body {
-  background: radial-gradient(1200px 800px at 10% 10%, #0e0d13 0%, #0b0a10 35%, #09080e 60%, #07060c 85%) !important;
-  color: var(--ink);
+/* Remove Streamlit white blocks */
+[data-testid="block-container"] {
+  background: transparent !important;
+  padding-top: 5rem !important;
+}
+[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"] {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
 }
 
-/* Animated motion background on login page */
+/* ================================
+   BACKGROUND ANIMATION LAYERS
+   ================================ */
+
+/* Layer 1: Main gradient blobs */
 .hero {
   position: fixed;
-  inset: -40px -40px auto -40px;
-  height: 52vh;
-  z-index: -1;
-  filter: blur(22px) saturate(120%);
-  opacity: .55;
+  inset: 0;
+  z-index: -3;
+  filter: blur(40px) saturate(150%);
+  opacity: 0.55;
   background:
-    radial-gradient(180px 220px at 10% 60%, #1a1639 0%, transparent 70%),
-    radial-gradient(220px 260px at 60% 30%, #1f2455 0%, transparent 72%),
-    radial-gradient(180px 240px at 80% 80%, #0f4c81 0%, transparent 70%),
-    radial-gradient(220px 260px at 30% 10%, #b00020 0%, transparent 70%);
-  animation: float 28s ease-in-out infinite alternate;
+    radial-gradient(400px 500px at 15% 80%, #8b003c 0%, transparent 75%),
+    radial-gradient(420px 480px at 75% 25%, #0039ff 0%, transparent 75%),
+    radial-gradient(380px 420px at 55% 70%, #7a00ff 0%, transparent 75%),
+    radial-gradient(480px 500px at 25% 15%, #0affc6 0%, transparent 75%);
+  animation: float 38s ease-in-out infinite alternate;
 }
 @keyframes float {
-  0%   { transform: translate3d(-10px,-8px,0) scale(1.02); }
-  100% { transform: translate3d(10px,8px,0)  scale(1.06); }
+  0%   { transform: translate3d(-20px, -15px, 0) scale(1.02); }
+  100% { transform: translate3d(20px, 15px, 0) scale(1.07); }
 }
 
-/* Titles */
-.rowtitle { font-size: 1.3rem; font-weight: 700; margin: 12px 6px 2px 6px; }
-.subtitle { color: var(--muted); margin: 0 6px 10px 6px; }
-
-/* Horizontal scroller */
-.scroller {
-  display: grid;
-  grid-auto-flow: column;
-  grid-auto-columns: minmax(180px, 1fr);
-  gap: 14px;
-  overflow-x: auto;
-  padding: 10px 6px 6px 6px;
-  scrollbar-width: thin;
+/* Layer 2: Ambient parallax glow */
+.parallax {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(circle at 70% 30%, rgba(255,255,255,0.08), transparent 60%),
+    radial-gradient(circle at 20% 80%, rgba(255,255,255,0.05), transparent 60%);
+  animation: drift 60s linear infinite;
+}
+@keyframes drift {
+  0%   { transform: translate3d(0,0,0); }
+  100% { transform: translate3d(-4%, 2%, 0); }
 }
 
-/* Card */
+/* Layer 3: Floating particles */
+.particles::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background-image: radial-gradient(white 1px, transparent 1px);
+  background-size: 2px 2px;
+  opacity: 0.16;
+  animation: starfield 140s linear infinite;
+}
+@keyframes starfield {
+  from { transform: translateY(0); }
+  to   { transform: translateY(-1800px); }
+}
+
+/* Cinematic vignette overlay */
+.vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  background: radial-gradient(circle, transparent 55%, rgba(0,0,0,0.55) 100%);
+}
+
+/* ================================
+   GLASS AUTH BOX
+   ================================ */
+section.main > div {
+  background: rgba(15, 15, 20, 0.55) !important;
+  backdrop-filter: blur(26px) saturate(180%) !important;
+  -webkit-backdrop-filter: blur(26px) saturate(180%);
+  border: 1px solid rgba(255,255,255,0.09);
+  border-radius: 16px;
+  padding: 34px 32px !important;
+  box-shadow: 0 10px 55px rgba(0,0,0,0.55);
+  max-width: 600px !important;
+  margin: auto !important;
+}
+
+/* ================================
+   TYPOGRAPHY + LOGO
+   ================================ */
+h1, .title-logo {
+  font-family: "Poppins", sans-serif;
+  font-weight: 700;
+  letter-spacing: -1px;
+  color: #ffffff;
+  text-shadow: 0 0 30px rgba(255,255,255,0.28);
+  animation: fadeIn 1.4s ease-out forwards;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ================================
+   BUTTON STYLE
+   ================================ */
+button, .stButton button {
+  border-radius: 10px !important;
+  padding: 12px 20px !important;
+  font-size: 16px !important;
+  font-weight: 600;
+  transition: 0.28s ease;
+}
+.stButton button:first-child {
+  background: #ff3b30 !important;
+  color: white !important;
+  box-shadow: 0 0 18px rgba(255, 0, 63, 0.4);
+}
+.stButton button:first-child:hover {
+  transform: translateY(-2px) scale(1.03);
+  box-shadow: 0 0 35px rgba(255, 0, 63, 0.55);
+}
+.stButton button:nth-child(2) {
+  background: rgba(255,255,255,0.15) !important;
+  color: #fff !important;
+  border: 1px solid rgba(255,255,255,0.25) !important;
+}
+.stButton button:nth-child(2):hover {
+  background: rgba(255,255,255,0.25) !important;
+  transform: translateY(-2px) scale(1.03);
+}
+
+/* ================================
+   CARD UI (HOME PAGE)
+   ================================ */
 .card {
-  background: linear-gradient(180deg, var(--card) 0%, #0f0f16 100%);
-  border: 1px solid var(--ring);
+  background: rgba(255,255,255,0.08);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
   border-radius: 14px;
-  padding: 8px;
-  box-shadow: 0 6px 30px rgba(0,0,0,.35);
-  transition: transform .2s ease, box-shadow .2s ease;
+  padding: 14px;
+  transition: 0.25s ease-out;
+  border: 1px solid rgba(255,255,255,0.1);
 }
 .card:hover {
-  transform: translateY(-3px);
-  box-shadow: 0 10px 36px rgba(0,0,0,.45);
+  transform: translateY(-6px) scale(1.03);
+  box-shadow: 0 18px 55px rgba(0,0,0,0.55);
+  border-color: rgba(255,255,255,0.3);
 }
 
-/* Poster placeholder if any */
-.ph.poster {
-  width: 100%;
-  padding-top: 150%;
-  border-radius: 10px;
-  background: linear-gradient(140deg, #222436 0%, #1a1a27 100%);
-  border: 1px dashed #2a2a3a;
+/* ================================
+   SCROLLER
+   ================================ */
+.scroller {
+  display: flex;
+  gap: 14px;
+  overflow-x: auto;
+  padding-bottom: 12px;
 }
-
-/* Text */
-.name { font-weight: 700; margin-top: 10px; font-size: .98rem; }
-.cap { color: var(--muted); font-size: .86rem; margin-top: 2px; }
-.tagline { color: #cfd2ff; margin-top: 4px; font-size: .86rem; }
-
-/* Domain pills */
-.pill { padding: 3px 8px; border-radius: 100px; font-size: .72rem; background: #26263a; color: #cfd2ff; }
-.pill.nf { background: #2a0e12; color: #ffb3b7; border: 1px solid #66131a; }
-.pill.az { background: #2a1a05; color: #ffd9a3; border: 1px solid #7a4a00; }
-.pill.sp { background: #062a12; color: #b7ffd5; border: 1px solid #0d5c29; }
-
-.blockpad { height: 8px; }
+.scroller::-webkit-scrollbar { height: 6px; }
+.scroller::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.18);
+  border-radius: 3px;
+}
