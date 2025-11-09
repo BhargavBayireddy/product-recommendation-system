@@ -1,118 +1,63 @@
-from __future__ import annotations
-import json
-from typing import Dict, List, Any
-from datetime import datetime, timezone
-
+# firebase_init.py
+# Works on Streamlit Cloud with secrets:
+# [FIREBASE_SERVICE_ACCOUNT] ...  and [FIREBASE_WEB_CONFIG] ...
+import time
 import streamlit as st
-import pyrebase
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, auth, firestore
+import pyrebase
 
+# ---- Admin SDK (service account from Streamlit Secrets) ----
+if "firebase_app" not in st.session_state:
+    sa_fields = dict(st.secrets["FIREBASE_SERVICE_ACCOUNT"])
+    cred = credentials.Certificate(sa_fields)
+    st.session_state["firebase_app"] = firebase_admin.initialize_app(cred)
+    st.session_state["db"] = firestore.client()
 
-# ---------------------------
-# Load secrets from Streamlit
-# ---------------------------
-WEB_CONFIG = st.secrets["FIREBASE_WEB_CONFIG"]
-SERVICE_ACCOUNT = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
+db = st.session_state["db"]
 
+# ---- Web SDK (email/password via pyrebase4) ----
+def _get_pyrebase():
+    cfg = dict(st.secrets["FIREBASE_WEB_CONFIG"])
+    return pyrebase.initialize_app({
+        "apiKey": cfg["apiKey"],
+        "authDomain": cfg["authDomain"],
+        "projectId": cfg["projectId"],
+        "storageBucket": cfg.get("storageBucket",""),
+        "messagingSenderId": cfg.get("messagingSenderId",""),
+        "appId": cfg["appId"],
+        "databaseURL": ""  # not using RTDB
+    })
 
-# ---------------------------
-# Init Firebase Admin (for Firestore)
-# ---------------------------
-if not firebase_admin._apps:
-    cred = credentials.Certificate(SERVICE_ACCOUNT)
-    firebase_admin.initialize_app(cred)
-
-_db = firestore.client()   # global Firestore client
-
-
-# ---------------------------
-# Init Client SDK (Auth)
-# ---------------------------
-_pb = pyrebase.initialize_app(WEB_CONFIG)
-_auth = _pb.auth()
-
-
-# ---------------------------
-# Firestore Collections
-# ---------------------------
-USERS = "users"
-SUB_INTERACTIONS = "interactions"
-GLOBAL_INTERACTIONS = "interactions_global"
-
-
-# ---------------------------
-# Auth Helpers
-# ---------------------------
 def signup_email_password(email: str, password: str):
-    try:
-        user = _auth.create_user_with_email_and_password(email, password)
-        ensure_user(user["localId"], email)
-        return user
-    except Exception as e:
-        raise RuntimeError(f"Signup error: {e}")
-
+    return _get_pyrebase().auth().create_user_with_email_and_password(email, password)
 
 def login_email_password(email: str, password: str):
-    try:
-        return _auth.sign_in_with_email_and_password(email, password)
-    except Exception as e:
-        raise RuntimeError(f"Login error: {e}")
+    return _get_pyrebase().auth().sign_in_with_email_and_password(email, password)
 
+def verify_id_token(id_token: str):
+    return auth.verify_id_token(id_token)
 
-# ---------------------------
-# Firestore Helpers
-# ---------------------------
+# ---- Firestore helpers (optional) ----
 def ensure_user(uid: str, email: str = ""):
-    """Create user doc if not exists"""
-    ref = _db.collection(USERS).document(uid)
+    ref = db.collection("users").document(uid)
     if not ref.get().exists:
-        ref.set({
-            "uid": uid,
-            "email": email,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        })
-
+        ref.set({"created_at": time.time(), "email": email})
 
 def add_interaction(uid: str, item_id: str, action: str):
-    """Store like/bag into user history + global feed"""
-    ensure_user(uid)
-    payload = {
-        "uid": uid,
-        "item_id": item_id,
-        "action": action,
-        "ts": datetime.now(timezone.utc).isoformat()
-    }
-    _db.collection(USERS).document(uid).collection(SUB_INTERACTIONS).add(payload)
-    _db.collection(GLOBAL_INTERACTIONS).add(payload)
-
-
-def fetch_user_interactions(uid: str, limit: int = 200) -> List[Dict[str, Any]]:
-    ensure_user(uid)
-    q = (_db.collection(USERS)
-         .document(uid)
-         .collection(SUB_INTERACTIONS)
-         .order_by("ts", direction=firestore.Query.DESCENDING)
-         .limit(limit))
-    return [d.to_dict() for d in q.stream()]
-
-
-def fetch_global_interactions(limit: int = 2000) -> List[Dict[str, Any]]:
-    q = (_db.collection(GLOBAL_INTERACTIONS)
-         .order_by("ts", direction=firestore.Query.DESCENDING)
-         .limit(limit))
-    return [d.to_dict() for d in q.stream()]
-
+    db.collection("interactions").document().set(
+        {"uid": uid, "item_id": item_id, "action": action, "ts": time.time()}
+    )
 
 def remove_interaction(uid: str, item_id: str, action: str):
-    ensure_user(uid)
+    q = db.collection("interactions").where("uid","==",uid).where("item_id","==",item_id).where("action","==",action).stream()
+    for doc in q:
+        db.collection("interactions").document(doc.id).delete()
 
-    # user scoped delete
-    uref = _db.collection(USERS).document(uid).collection(SUB_INTERACTIONS)
-    for d in uref.where("item_id", "==", item_id).where("action", "==", action).stream():
-        d.reference.delete()
+def fetch_user_interactions(uid: str):
+    col = db.collection("interactions").where("uid","==",uid).order_by("ts", direction=firestore.Query.DESCENDING).limit(500)
+    return [x.to_dict() for x in col.stream()]
 
-    # global feed delete
-    gref = _db.collection(GLOBAL_INTERACTIONS)
-    for d in gref.where("uid", "==", uid).where("item_id", "==", item_id).where("action", "==", action).stream():
-        d.reference.delete()
+def fetch_global_interactions(limit: int = 2000):
+    col = db.collection("interactions").order_by("ts", direction=firestore.Query.DESCENDING).limit(limit)
+    return [x.to_dict() for x in col.stream()]
