@@ -1,5 +1,5 @@
 /* ================================
-   ReccoVerse UI – LEVEL 2 CINEMATIC MODE
+   ReccoVerse UI – LEVEL 2 CINEMATIC MODE (Option A)
    ================================ */
 
 /* --- GLOBAL DARK CANVAS --- */
@@ -175,3 +175,16 @@ button, .stButton button {
   background: rgba(255,255,255,0.18);
   border-radius: 3px;
 }
+
+/* Pills */
+.pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#222; color:#fff; }
+.pill.nf { background:#e50914; }
+.pill.az { background:#ff9900; }
+.pill.sp { background:#1db954; }
+
+.rowtitle { font-size: 22px; font-weight: 700; margin: 8px 0 4px; }
+.subtitle { font-size: 14px; opacity: .8; margin-bottom: 10px; }
+.blockpad { height: 18px; }
+.name { font-weight: 700; margin-bottom: 6px; }
+.cap { font-size: 13px; opacity: .9; }
+.tagline { font-size: 12px; opacity: .9; margin-top: 8px; }
