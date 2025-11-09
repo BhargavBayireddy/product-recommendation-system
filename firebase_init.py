@@ -1,63 +1,67 @@
 # firebase_init.py
-# Works on Streamlit Cloud with secrets:
-# [FIREBASE_SERVICE_ACCOUNT] ...  and [FIREBASE_WEB_CONFIG] ...
-import time
-import streamlit as st
+# Unified Firebase Auth + Firestore helper for Streamlit Cloud
+
+import json
 import firebase_admin
-from firebase_admin import credentials, auth, firestore
+from firebase_admin import credentials, firestore, auth
 import pyrebase
+import streamlit as st
 
-# ---- Admin SDK (service account from Streamlit Secrets) ----
-if "firebase_app" not in st.session_state:
-    sa_fields = dict(st.secrets["FIREBASE_SERVICE_ACCOUNT"])
-    cred = credentials.Certificate(sa_fields)
-    st.session_state["firebase_app"] = firebase_admin.initialize_app(cred)
-    st.session_state["db"] = firestore.client()
+# --- Load Secrets ---
+fb_web = st.secrets["FIREBASE_WEB_CONFIG"]
+fb_svc = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
 
-db = st.session_state["db"]
+# --- Pyrebase (Auth, Realtime DB style) ---
+pb = pyrebase.initialize_app(fb_web)
+pb_auth = pb.auth()
 
-# ---- Web SDK (email/password via pyrebase4) ----
-def _get_pyrebase():
-    cfg = dict(st.secrets["FIREBASE_WEB_CONFIG"])
-    return pyrebase.initialize_app({
-        "apiKey": cfg["apiKey"],
-        "authDomain": cfg["authDomain"],
-        "projectId": cfg["projectId"],
-        "storageBucket": cfg.get("storageBucket",""),
-        "messagingSenderId": cfg.get("messagingSenderId",""),
-        "appId": cfg["appId"],
-        "databaseURL": ""  # not using RTDB
-    })
+def signup_email_password(email, password):
+    return pb_auth.create_user_with_email_and_password(email, password)
 
-def signup_email_password(email: str, password: str):
-    return _get_pyrebase().auth().create_user_with_email_and_password(email, password)
+def login_email_password(email, password):
+    return pb_auth.sign_in_with_email_and_password(email, password)
 
-def login_email_password(email: str, password: str):
-    return _get_pyrebase().auth().sign_in_with_email_and_password(email, password)
+# --- Firebase Admin (Firestore) ---
+if not firebase_admin._apps:
+    cred = credentials.Certificate(json.loads(json.dumps(fb_svc)))
+    firebase_admin.initialize_app(cred)
 
-def verify_id_token(id_token: str):
-    return auth.verify_id_token(id_token)
+_db = firestore.client()
 
-# ---- Firestore helpers (optional) ----
-def ensure_user(uid: str, email: str = ""):
-    ref = db.collection("users").document(uid)
-    if not ref.get().exists:
-        ref.set({"created_at": time.time(), "email": email})
+def get_firestore_client():
+    """Return Firestore db instance so other modules can use it."""
+    return _db
 
-def add_interaction(uid: str, item_id: str, action: str):
-    db.collection("interactions").document().set(
-        {"uid": uid, "item_id": item_id, "action": action, "ts": time.time()}
+# --- Firestore helpers (optional but used by app.py) ---
+def ensure_user(uid, email=None):
+    _db.collection("users").document(uid).set(
+        {"email": email or "", "created": firestore.SERVER_TIMESTAMP},
+        merge=True
     )
 
-def remove_interaction(uid: str, item_id: str, action: str):
-    q = db.collection("interactions").where("uid","==",uid).where("item_id","==",item_id).where("action","==",action).stream()
-    for doc in q:
-        db.collection("interactions").document(doc.id).delete()
+def add_interaction(uid, item_id, action):
+    _db.collection("interactions").add({
+        "uid": uid,
+        "item_id": item_id,
+        "action": action,
+        "ts": firestore.SERVER_TIMESTAMP
+    })
 
-def fetch_user_interactions(uid: str):
-    col = db.collection("interactions").where("uid","==",uid).order_by("ts", direction=firestore.Query.DESCENDING).limit(500)
-    return [x.to_dict() for x in col.stream()]
+def remove_interaction(uid, item_id, action):
+    q = (_db.collection("interactions")
+         .where("uid", "==", uid)
+         .where("item_id", "==", item_id)
+         .where("action", "==", action))
+    for doc in q.stream():
+        doc.reference.delete()
 
-def fetch_global_interactions(limit: int = 2000):
-    col = db.collection("interactions").order_by("ts", direction=firestore.Query.DESCENDING).limit(limit)
-    return [x.to_dict() for x in col.stream()]
+def fetch_user_interactions(uid):
+    q = _db.collection("interactions").where("uid", "==", uid).stream()
+    return [{"uid": uid, **d.to_dict()} for d in q]
+
+def fetch_global_interactions(limit=2000):
+    q = (_db.collection("interactions")
+         .order_by("ts", direction=firestore.Query.DESCENDING)
+         .limit(limit)
+         .stream())
+    return [{"id": d.id, **d.to_dict()} for d in q]
