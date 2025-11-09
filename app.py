@@ -1,4 +1,4 @@
-# app.py
+# app.py  — ReccoVerse (Option A: full-screen cinematic login)
 import os, json, time, hashlib
 from pathlib import Path
 from datetime import datetime
@@ -31,19 +31,14 @@ try:
     from firebase_init import (
         signup_email_password, login_email_password,
         add_interaction, fetch_user_interactions, ensure_user,
-        remove_interaction, fetch_global_interactions,
-        get_firestore_client
+        remove_interaction, fetch_global_interactions
     )
-    _db = get_firestore_client()
 except Exception as e:
     USE_FIREBASE = False
     FB_IMPORT_ERR = str(e)
 
 # -------------------- Embeddings / GNN --------------------
 from gnn_infer import load_item_embeddings, make_user_vector
-
-# -------------------- Thumbnails (Hybrid fetcher) --------------------
-from thumb_fetcher import get_or_create_thumb  # returns bytes
 
 # -------------------- CSS --------------------
 if CSS_FILE.exists():
@@ -60,7 +55,7 @@ def enable_auto_refresh(seconds=5):
             unsafe_allow_html=True,
         )
 
-# -------------------- Local fallback store (used only if Firebase write fails) --------------------
+# -------------------- Local fallback store (if Firebase write fails) --------------------
 LOCAL_STORE = BASE / ".local_interactions.json"
 
 def _local_write(uid, item_id, action):
@@ -170,6 +165,10 @@ def read_global_interactions(limit=2000):
         return []
 
 # -------------------- Reco helpers --------------------
+def user_has_history(uid) -> bool:
+    inter = read_interactions(uid)
+    return any(a.get("action") in ("like","bag") for a in inter)
+
 def user_vector(uid):
     inter = read_interactions(uid)
     return make_user_vector(interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS)
@@ -184,6 +183,10 @@ def _parse_ts(ts_str):
         return 0.0
 
 def collaborative_candidates_aggressive(uid, top_k=12):
+    """
+    If I liked A and other users also liked A, recommend whatever else they liked.
+    SHOW ALL (even if I already liked it). Ranked by my score + small recency boost.
+    """
     my = read_interactions(uid)
     my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
     if not my_likes:
@@ -271,10 +274,10 @@ def recommend(uid, k=48):
 # -------------------- UI helpers --------------------
 CHEESE = [
     "Hot pick. Zero regrets.",
-    "Small click. Big vibe.",
+    "Tiny click. Big vibe.",
     "Your next favorite, probably.",
-    "Clean choice. Solid taste.",
-    "Trust the signal.",
+    "Chef's kiss material.",
+    "Trust the vibes.",
     "Mood booster approved.",
 ]
 def cheesy_line(item_id: str, name: str, domain: str) -> str:
@@ -288,13 +291,6 @@ def pill(dom: str) -> str:
     if dom == "spotify": return '<span class="pill sp">Spotify</span>'
     return f'<span class="pill">{dom.title()}</span>'
 
-def _resolve_image_bytes(row: pd.Series) -> bytes:
-    title  = str(row.get("name","")).strip() or "Item"
-    domain = str(row.get("domain","")).strip().lower()
-    tags   = [str(row.get("category","")).strip(), str(row.get("mood","")).strip()]
-    # Cache-safe call: only hashable params
-    return get_or_create_thumb(item_id=row["item_id"], title=title, domain=domain, tags=tags)
-
 def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "", show_cheese: bool=False, allow_remove=False):
     if df is None or len(df) == 0: return
     st.markdown(f'<div class="rowtitle">{title}</div>', unsafe_allow_html=True)
@@ -307,16 +303,9 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
         col = cols[i % len(cols)]
         with col:
             dom_class = "nf" if row["domain"]=="netflix" else ("az" if row["domain"]=="amazon" else ("sp" if row["domain"]=="spotify" else "xx"))
-            st.markdown(f'<div class="card {dom_class}">', unsafe_allow_html=True)
+            st.markdown(f'<div class="card textonly {dom_class}">', unsafe_allow_html=True)
 
-            # Poster
-            try:
-                img_bytes = _resolve_image_bytes(row)
-                st.image(img_bytes, use_container_width=True, caption=None)
-            except Exception:
-                st.markdown('<div class="ph poster"></div>', unsafe_allow_html=True)
-
-            # Text
+            # IMAGE SLOT (thumbnail placeholder – text only in this build)
             st.markdown(f'<div class="name">{row["name"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
 
@@ -401,11 +390,11 @@ def compute_fast_metrics(uid):
     return out
 
 def page_compare(uid):
-    st.header("Model vs Model — who recommends better")
+    st.header("Model vs Model — Who Recommends Better?")
     df = compute_fast_metrics(uid)
     COLORS = {"Our GNN":"#1DB954","Popularity":"#E50914","Random":"#FF9900"}
 
-    st.subheader("Overall Quality (higher is better)")
+    st.subheader("Overall Quality (↑ better)")
     order = df.sort_values("overall_score", ascending=False)
     fig = px.bar(order, x="model", y="overall_score_100", color="model",
                  text="overall_score_100", color_discrete_map=COLORS)
@@ -426,7 +415,7 @@ def page_compare(uid):
                        xaxis_title="", yaxis_title="Score (0–100)", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("Latency (ms, lower is better)")
+    st.subheader("Latency (ms, ↓ better)")
     lat = df.sort_values("latency_ms", ascending=True)
     fig3 = px.bar(lat, x="latency_ms", y="model", orientation="h",
                   text=lat["latency_ms"].round(0).astype(int), color="model", color_discrete_map=COLORS)
@@ -437,11 +426,12 @@ def page_compare(uid):
 
 # -------------------- Pages --------------------
 def page_home():
-    st.caption(f"Backend: QUANTA-GNN Hybrid · Live collab on")
+    st.caption(f"Backend: {BACKEND} · Live collab on")
     live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
     if live:
         enable_auto_refresh(5)
 
+    # Search first
     q = st.text_input("Search anything (name, domain, category, mood)...").strip()
     if q:
         qlow = q.lower()
@@ -454,12 +444,15 @@ def page_home():
 
     top, collab, because, explore = recommend(st.session_state["uid"], k=48)
 
+    # Top picks
     card_row(top.head(12), "top", "Top picks for you",
              "If taste had a leaderboard, these would be S-tier", True)
 
+    # Vibe-twins after top
     if not collab.empty:
-        card_row(collab, "collab", "Your vibe-twins also loved…", show_cheese=True)
+        card_row(collab, "collab", "People like you also loved…", show_cheese=True)
 
+    # Explore
     card_row(explore.head(12), "explore", "Explore something different",
              "Happy accidents live here", False)
 
@@ -499,17 +492,23 @@ def _parse_firebase_error(msg: str) -> str:
     return "generic"
 
 def login_ui():
-    st.markdown('<div class="hero"></div>', unsafe_allow_html=True)
-    st.title("ReccoVerse")
-    st.subheader("Sign in to continue")
+    # Animated background layers (Option A – cinematic full-screen)
+    st.markdown("""
+    <div class="hero"></div>
+    <div class="parallax"></div>
+    <div class="particles"></div>
+    <div class="vignette"></div>
+    """, unsafe_allow_html=True)
 
+    st.title("ReccoVerse")
     if not USE_FIREBASE:
-        st.error("This deployment requires Firebase. Import failed.\n\n" +
+        st.error("This deployment requires Firebase. Import failed.\n\n"
                  "Please ensure Streamlit Secrets contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
         if 'FB_IMPORT_ERR' in globals():
             st.code(FB_IMPORT_ERR)
         st.stop()
 
+    st.subheader("Sign in to continue")
     email = st.text_input("Email")
     pwd   = st.text_input("Password", type="password")
     c1, c2 = st.columns(2)
@@ -539,7 +538,7 @@ def login_ui():
     with c2:
         if st.button("Create account", use_container_width=True):
             if not email or not pwd:
-                st.warning("Enter email and password, then click Create account.")
+                st.warning("Enter email & password, then click Create account.")
             else:
                 try:
                     signup_email_password(email, pwd)
