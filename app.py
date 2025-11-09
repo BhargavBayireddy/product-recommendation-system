@@ -520,12 +520,16 @@ def login_ui():
                 st.warning("Email and password required.")
             else:
                 try:
+                    .
                     raw = login_email_password(email, pwd)
-                    user = json.loads(json.dumps(raw))   # convert AttrDict → normal dict
+                    user = json.loads(json.dumps(raw))  # ✅ Fix AttrDict
                     st.session_state["uid"] = user["localId"]
                     st.session_state["email"] = email
                     ensure_user(st.session_state["uid"], email=email)
                     st.rerun()
+                except Exception as e:
+                     st.error(str(e))
+
                 except Exception as e:
                     kind = _parse_firebase_error(str(e))
                     if kind == "not_found":
