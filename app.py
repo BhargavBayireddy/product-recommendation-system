@@ -24,6 +24,8 @@ ART.mkdir(exist_ok=True)
 
 ITEMS_CSV = ART / "items_snapshot.csv"
 CSS_FILE  = BASE / "ui.css"
+if CSS_FILE.exists():
+    st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
 
 # -------------------- Firebase (REQUIRED) --------------------
 USE_FIREBASE = True
