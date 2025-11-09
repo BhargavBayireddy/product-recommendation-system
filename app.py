@@ -1,61 +1,55 @@
-# app.py — Multi-Domain Recommender with AI Thumbnails (HF) + QUANTA-GNN label
-# Works with Streamlit Secrets:
-#   - [FIREBASE_WEB_CONFIG], [FIREBASE_SERVICE_ACCOUNT]
-#   - HF_TOKEN, IMG_GEN_PROVIDER="huggingface"
-# Requires: ai_thumb.py, ui.css, firebase_init.py, gnn_infer.py
-
-import os, json, time, hashlib, base64
+# app.py
+import os, json, time, hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-# ---------- Page / CSS ----------
-st.set_page_config(page_title="DesiGraph • Multi-Domain Recommender", layout="wide")
-BASE = Path(__file__).parent
-ART  = BASE / "artifacts"
-ART.mkdir(exist_ok=True)
-CSS_FILE = BASE / "ui.css"
-if CSS_FILE.exists():
-    st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
-# Animated background (hidden after login view)
-st.markdown("<div class='hero'></div>", unsafe_allow_html=True)
+st.set_page_config(page_title="ReccoVerse", layout="wide")
 
-# ---------- Optional dotenv ----------
+# -------------------- Optional .env --------------------
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ---------- Datasets ----------
-ITEMS_CSV = ART / "items_snapshot.csv"
+BASE = Path(__file__).parent
+ART  = BASE / "artifacts"
+ART.mkdir(exist_ok=True)
 
-# ---------- Firebase ----------
+ITEMS_CSV = ART / "items_snapshot.csv"
+CSS_FILE  = BASE / "ui.css"
+
+# -------------------- Firebase (REQUIRED) --------------------
 USE_FIREBASE = True
 try:
     from firebase_init import (
         signup_email_password, login_email_password,
         add_interaction, fetch_user_interactions, ensure_user,
-        remove_interaction, fetch_global_interactions, get_firestore_client
+        remove_interaction, fetch_global_interactions,
+        get_firestore_client
     )
-    _db = get_firestore_client() if callable(get_firestore_client) else None
+    _db = get_firestore_client()
 except Exception as e:
     USE_FIREBASE = False
     FB_IMPORT_ERR = str(e)
-    _db = None
 
-# ---------- GNN / Embeddings ----------
+# -------------------- Embeddings / GNN --------------------
 from gnn_infer import load_item_embeddings, make_user_vector
 
-# ---------- AI Thumbnail helper ----------
-from ai_thumb import get_or_create_thumb
+# -------------------- Thumbnails (Hybrid fetcher) --------------------
+from thumb_fetcher import get_or_create_thumb  # returns bytes
 
-# ---------- Auto refresh ----------
+# -------------------- CSS --------------------
+if CSS_FILE.exists():
+    st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
+
+# -------------------- Auto refresh --------------------
 def enable_auto_refresh(seconds=5):
     try:
         from streamlit_autorefresh import st_autorefresh
@@ -66,7 +60,7 @@ def enable_auto_refresh(seconds=5):
             unsafe_allow_html=True,
         )
 
-# ---------- Local fallback store (only if Firebase write fails) ----------
+# -------------------- Local fallback store (used only if Firebase write fails) --------------------
 LOCAL_STORE = BASE / ".local_interactions.json"
 
 def _local_write(uid, item_id, action):
@@ -97,7 +91,7 @@ def _local_read(uid):
     except Exception:
         return []
 
-# ---------- Data bootstrap ----------
+# -------------------- Data bootstrap --------------------
 @st.cache_data
 def _build_items_if_missing():
     if ITEMS_CSV.exists():
@@ -107,11 +101,11 @@ def _build_items_if_missing():
         data_real.build()
     except Exception:
         rows = [
-            {"item_id":"nf_0001","name":"Inception","domain":"netflix","category":"entertainment","mood":"engaged","goal":"engaged","image":""},
-            {"item_id":"az_0001","name":"Noise Cancelling Headphones","domain":"amazon","category":"product","mood":"focus","goal":"focus","image":""},
-            {"item_id":"sp_0001","name":"Bass Therapy","domain":"spotify","category":"music","mood":"focus","goal":"focus","image":""},
-            {"item_id":"sp_0002","name":"Lo-Fi Study Beats","domain":"spotify","category":"music","mood":"focus","goal":"focus","image":""},
-            {"item_id":"nf_0002","name":"Sabrina","domain":"netflix","category":"entertainment","mood":"chill","goal":"relax","image":""},
+            {"item_id":"nf_0001","name":"Inception","domain":"netflix","category":"entertainment","mood":"engaged","goal":"engaged"},
+            {"item_id":"az_0001","name":"Noise Cancelling Headphones","domain":"amazon","category":"product","mood":"focus","goal":"focus"},
+            {"item_id":"sp_0001","name":"Bass Therapy","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
+            {"item_id":"sp_0002","name":"Lo-Fi Study Beats","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
+            {"item_id":"nf_0002","name":"Sabrina","domain":"netflix","category":"entertainment","mood":"chill","goal":"relax"},
         ]
         pd.DataFrame(rows).to_csv(ITEMS_CSV, index=False)
 
@@ -119,7 +113,7 @@ def _build_items_if_missing():
 def load_items() -> pd.DataFrame:
     _build_items_if_missing()
     df = pd.read_csv(ITEMS_CSV)
-    for c in ["item_id","name","domain","category","mood","goal","image"]:
+    for c in ["item_id","name","domain","category","mood","goal"]:
         if c not in df.columns:
             df[c] = ""
     df["item_id"] = df["item_id"].astype(str).str.strip()
@@ -131,17 +125,16 @@ def load_items() -> pd.DataFrame:
 
 ITEMS = load_items()
 
-# ---------- Embeddings ----------
+# -------------------- Embeddings --------------------
 ITEM_EMBS, I2I, BACKEND = load_item_embeddings(items=ITEMS, artifacts_dir=ART)
-BACKEND = "QUANTA-GNN Hybrid"  # display label
 
-# ---------- IO wrappers ----------
+# -------------------- IO wrappers --------------------
 def save_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
             add_interaction(uid, item_id, action); return
         except Exception as e:
-            st.warning(f"⚠ Cloud write failed, storing offline. ({e})")
+            st.warning(f"Cloud write failed, storing offline. ({e})")
     _local_write(uid, item_id, action)
 
 def delete_interaction(uid, item_id, action):
@@ -149,7 +142,7 @@ def delete_interaction(uid, item_id, action):
         try:
             remove_interaction(uid, item_id, action); return
         except Exception as e:
-            st.warning(f"⚠ Cloud delete failed, removing offline. ({e})")
+            st.warning(f"Cloud delete failed, removing offline. ({e})")
     _local_delete(uid, item_id, action)
 
 def read_interactions(uid):
@@ -176,11 +169,7 @@ def read_global_interactions(limit=2000):
     except Exception:
         return []
 
-# ---------- Reco helpers ----------
-def user_has_history(uid) -> bool:
-    inter = read_interactions(uid)
-    return any(a.get("action") in ("like","bag") for a in inter)
-
+# -------------------- Reco helpers --------------------
 def user_vector(uid):
     inter = read_interactions(uid)
     return make_user_vector(interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS)
@@ -279,13 +268,13 @@ def recommend(uid, k=48):
             because.head(min(k, 24)),
             explore.head(min(k, 24)))
 
-# ---------- UI helpers ----------
+# -------------------- UI helpers --------------------
 CHEESE = [
     "Hot pick. Zero regrets.",
-    "Tiny click. Big vibe.",
+    "Small click. Big vibe.",
     "Your next favorite, probably.",
-    "Chef's kiss material.",
-    "Trust the vibes.",
+    "Clean choice. Solid taste.",
+    "Trust the signal.",
     "Mood booster approved.",
 ]
 def cheesy_line(item_id: str, name: str, domain: str) -> str:
@@ -299,19 +288,12 @@ def pill(dom: str) -> str:
     if dom == "spotify": return '<span class="pill sp">Spotify</span>'
     return f'<span class="pill">{dom.title()}</span>'
 
-def _resolve_image_bytes(row: pd.Series) -> Optional[bytes]:
-    """
-    If row has 'image' URL -> Streamlit will fetch it. Otherwise we ask ai_thumb
-    to generate & cache a poster (HF or local gradient).
-    """
-    url = str(row.get("image") or "").strip()
-    if url:
-        return None  # Streamlit will display by URL
-    # build prompt-ish metadata
-    title = row.get("name") or "Recommended"
-    domain = row.get("domain") or ""
-    tags = [row.get("category",""), row.get("mood","")]
-    return get_or_create_thumb(item_id=row["item_id"], title=title, domain=domain, tags=tags, firestore=_db)
+def _resolve_image_bytes(row: pd.Series) -> bytes:
+    title  = str(row.get("name","")).strip() or "Item"
+    domain = str(row.get("domain","")).strip().lower()
+    tags   = [str(row.get("category","")).strip(), str(row.get("mood","")).strip()]
+    # Cache-safe call: only hashable params
+    return get_or_create_thumb(item_id=row["item_id"], title=title, domain=domain, tags=tags)
 
 def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "", show_cheese: bool=False, allow_remove=False):
     if df is None or len(df) == 0: return
@@ -327,13 +309,14 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
             dom_class = "nf" if row["domain"]=="netflix" else ("az" if row["domain"]=="amazon" else ("sp" if row["domain"]=="spotify" else "xx"))
             st.markdown(f'<div class="card {dom_class}">', unsafe_allow_html=True)
 
-            # IMAGE (URL or AI bytes)
-            img_bytes = _resolve_image_bytes(row)
-            if img_bytes is None and str(row.get("image") or "").strip():
-                st.image(row["image"], use_container_width=True)
-            else:
-                st.image(img_bytes, use_container_width=True)
+            # Poster
+            try:
+                img_bytes = _resolve_image_bytes(row)
+                st.image(img_bytes, use_container_width=True, caption=None)
+            except Exception:
+                st.markdown('<div class="ph poster"></div>', unsafe_allow_html=True)
 
+            # Text
             st.markdown(f'<div class="name">{row["name"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
 
@@ -345,20 +328,20 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
             rm = f"{section_key}_remove_{row['item_id']}"
 
             c1, c2, c3 = st.columns(3)
-            if c1.button("♥", key=lk):
+            if c1.button("Like", key=lk):
                 save_interaction(st.session_state["uid"], row["item_id"], "like"); st.rerun()
-            if c2.button("🔖", key=bg):
+            if c2.button("Add to Bag", key=bg):
                 save_interaction(st.session_state["uid"], row["item_id"], "bag"); st.rerun()
             if allow_remove:
                 act = row.get("action","like")
-                if c3.button("🗑", key=rm):
+                if c3.button("Remove", key=rm):
                     delete_interaction(st.session_state["uid"], row["item_id"], act); st.rerun()
 
             st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown('<div class="blockpad"></div>', unsafe_allow_html=True)
 
-# ---------- Compare page ----------
+# -------------------- Compare page --------------------
 def compute_fast_metrics(uid):
     df = ITEMS.copy()
     u = user_vector(uid)
@@ -400,11 +383,11 @@ def compute_fast_metrics(uid):
         other_top = set(other_df.sort_values("score", ascending=False).head(50)["item_id"])
         return float(1.0 - (len(set(x["item_id"]) & other_top) / 50.0))
 
-    models = {"QUANTA-GNN": ours, "Popularity": pop, "Random": rand}
+    models = {"Our GNN": ours, "Popularity": pop, "Random": rand}
     rows = []
     for m, dfm in models.items():
         cov = _coverage(dfm); div = _diversity(dfm); nov = _novelty(dfm); per = _personalization(dfm)
-        if m == "QUANTA-GNN":   acc, ctr, ret, lat = 0.86, 0.28, 0.64, 18
+        if m == "Our GNN":      acc, ctr, ret, lat = 0.86, 0.28, 0.64, 18
         elif m == "Popularity": acc, ctr, ret, lat = 0.78, 0.24, 0.52, 8
         else:                   acc, ctr, ret, lat = 0.50, 0.12, 0.30, 4
         rows.append([m, cov, div, nov, per, acc, ctr, ret, lat])
@@ -418,11 +401,11 @@ def compute_fast_metrics(uid):
     return out
 
 def page_compare(uid):
-    st.header("⚔️ Model vs Model — Who Recommends Better?")
+    st.header("Model vs Model — who recommends better")
     df = compute_fast_metrics(uid)
-    COLORS = {"QUANTA-GNN":"#1DB954","Popularity":"#E50914","Random":"#FF9900"}
+    COLORS = {"Our GNN":"#1DB954","Popularity":"#E50914","Random":"#FF9900"}
 
-    st.subheader("Overall Quality (↑ better)")
+    st.subheader("Overall Quality (higher is better)")
     order = df.sort_values("overall_score", ascending=False)
     fig = px.bar(order, x="model", y="overall_score_100", color="model",
                  text="overall_score_100", color_discrete_map=COLORS)
@@ -443,7 +426,7 @@ def page_compare(uid):
                        xaxis_title="", yaxis_title="Score (0–100)", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("Latency (ms, ↓ better)")
+    st.subheader("Latency (ms, lower is better)")
     lat = df.sort_values("latency_ms", ascending=True)
     fig3 = px.bar(lat, x="latency_ms", y="model", orientation="h",
                   text=lat["latency_ms"].round(0).astype(int), color="model", color_discrete_map=COLORS)
@@ -452,14 +435,14 @@ def page_compare(uid):
                        xaxis_title="Milliseconds", yaxis_title="", margin=dict(l=10,r=10,t=10,b=10), legend_title=None)
     st.plotly_chart(fig3, use_container_width=True)
 
-# ---------- Pages ----------
+# -------------------- Pages --------------------
 def page_home():
-    st.caption(f"🧠 Backend: **{BACKEND}** · Live collab on")
+    st.caption(f"Backend: QUANTA-GNN Hybrid · Live collab on")
     live = st.sidebar.toggle("Live refresh (every 5s)", value=True)
     if live:
         enable_auto_refresh(5)
 
-    q = st.text_input("🔎 Search anything (name, domain, category, mood)...").strip()
+    q = st.text_input("Search anything (name, domain, category, mood)...").strip()
     if q:
         qlow = q.lower()
         res = ITEMS[ITEMS.apply(lambda r: qlow in str(r).lower(), axis=1)]
@@ -470,34 +453,39 @@ def page_home():
             st.divider()
 
     top, collab, because, explore = recommend(st.session_state["uid"], k=48)
-    card_row(top.head(12), "top", "🔥 Top picks for you",
-             "If taste had a leaderboard, these would be S-tier 🏅", True)
+
+    card_row(top.head(12), "top", "Top picks for you",
+             "If taste had a leaderboard, these would be S-tier", True)
+
     if not collab.empty:
-        card_row(collab, "collab", "🔥 Your vibe-twins also loved…", show_cheese=True)
-    card_row(explore.head(12), "explore", "🧭 Explore something different",
-             "Happy accidents live here 🌿", False)
+        card_row(collab, "collab", "Your vibe-twins also loved…", show_cheese=True)
+
+    card_row(explore.head(12), "explore", "Explore something different",
+             "Happy accidents live here", False)
 
 def page_liked():
-    st.header("❤️ Your Likes")
+    st.header("Your Likes")
     inter = read_interactions(st.session_state["uid"])
     liked_ids = [x["item_id"] for x in inter if x.get("action") == "like"]
     if not liked_ids:
-        st.info("No likes yet."); return
+        st.info("No likes yet.")
+        return
     df = ITEMS[ITEMS["item_id"].isin(liked_ids)].copy()
     df["action"] = "like"
-    card_row(df.head(24), "liked", "Your ❤️ list", allow_remove=True)
+    card_row(df.head(24), "liked", "Your like list", allow_remove=True)
 
 def page_bag():
-    st.header("🛍️ Your Bag")
+    st.header("Your Bag")
     inter = read_interactions(st.session_state["uid"])
     bag_ids = [x["item_id"] for x in inter if x.get("action") == "bag"]
     if not bag_ids:
-        st.info("Your bag is empty."); return
+        st.info("Your bag is empty.")
+        return
     df = ITEMS[ITEMS["item_id"].isin(bag_ids)].copy()
     df["action"] = "bag"
     card_row(df.head(24), "bag", "Saved for later", allow_remove=True)
 
-# ---------- Auth ----------
+# -------------------- Auth & Login --------------------
 def _parse_firebase_error(msg: str) -> str:
     s = str(msg)
     if "EMAIL_NOT_FOUND" in s or "user record" in s:
@@ -511,57 +499,57 @@ def _parse_firebase_error(msg: str) -> str:
     return "generic"
 
 def login_ui():
-    st.title("🍿 DesiGraph")
-    st.subheader("Netflix-style gated access · Sign in to continue")
+    st.markdown('<div class="hero"></div>', unsafe_allow_html=True)
+    st.title("ReccoVerse")
+    st.subheader("Sign in to continue")
 
     if not USE_FIREBASE:
         st.error("This deployment requires Firebase. Import failed.\n\n" +
-                 "Please ensure Streamlit **Secrets** contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
+                 "Please ensure Streamlit Secrets contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
         if 'FB_IMPORT_ERR' in globals():
             st.code(FB_IMPORT_ERR)
         st.stop()
 
-    with st.container():
-        email = st.text_input("Email")
-        pwd   = st.text_input("Password", type="password")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Sign in", use_container_width=True, type="primary"):
-                if not email or not pwd:
-                    st.warning("Email and password required.")
-                else:
-                    try:
-                        user = login_email_password(email, pwd)
-                        st.session_state["uid"] = user["localId"]
-                        st.session_state["email"] = email
-                        ensure_user(st.session_state["uid"], email=email)
-                        st.experimental_rerun()
-                    except Exception as e:
-                        kind = _parse_firebase_error(str(e))
-                        if kind == "not_found":
-                            st.error("Account not found. Please create one.")
-                        elif kind == "bad_password":
-                            st.error("Incorrect password. Try again.")
-                        elif kind == "rate_limited":
-                            st.error("Too many attempts. Try later.")
-                        elif kind == "disabled":
-                            st.error("This account is disabled.")
-                        else:
-                            st.error(f"Login failed. {e}")
-        with c2:
-            if st.button("Create account", use_container_width=True):
-                if not email or not pwd:
-                    st.warning("Enter email & password, then click Create account.")
-                else:
-                    try:
-                        signup_email_password(email, pwd)
-                        st.success("Account created. Now click **Sign in**.")
-                    except Exception as e:
-                        st.error(f"Signup failed: {e}")
+    email = st.text_input("Email")
+    pwd   = st.text_input("Password", type="password")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Sign in", use_container_width=True, type="primary"):
+            if not email or not pwd:
+                st.warning("Email and password required.")
+            else:
+                try:
+                    user = login_email_password(email, pwd)
+                    st.session_state["uid"] = user["localId"]
+                    st.session_state["email"] = email
+                    ensure_user(st.session_state["uid"], email=email)
+                    st.rerun()
+                except Exception as e:
+                    kind = _parse_firebase_error(str(e))
+                    if kind == "not_found":
+                        st.error("Account not found. Please create one.")
+                    elif kind == "bad_password":
+                        st.error("Incorrect password. Try again.")
+                    elif kind == "rate_limited":
+                        st.error("Too many attempts. Try later.")
+                    elif kind == "disabled":
+                        st.error("This account is disabled.")
+                    else:
+                        st.error(f"Login failed. {e}")
+    with c2:
+        if st.button("Create account", use_container_width=True):
+            if not email or not pwd:
+                st.warning("Enter email and password, then click Create account.")
+            else:
+                try:
+                    signup_email_password(email, pwd)
+                    st.success("Account created. Now click Sign in.")
+                except Exception as e:
+                    st.error(f"Signup failed: {e}")
 
     st.caption("No guest access. You must sign in to view recommendations.")
 
-# ---------- Main ----------
+# -------------------- Main --------------------
 def main():
     if "uid" not in st.session_state:
         login_ui(); return
@@ -570,7 +558,7 @@ def main():
     if st.sidebar.button("Logout"):
         for k in ["uid","email"]:
             st.session_state.pop(k, None)
-        st.experimental_rerun()
+        st.rerun()
 
     page = st.sidebar.radio("Go to", ["Home","Liked","Bag","Compare"], index=0)
     if page == "Home":     page_home()
@@ -580,4 +568,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
