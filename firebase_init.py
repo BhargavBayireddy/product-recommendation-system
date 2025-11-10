@@ -89,3 +89,13 @@ def remove_interaction(uid, item_id, action):
     docs = firestore_client.collection("interactions").where("uid", "==", uid).where("item_id", "==", item_id).where("action", "==", action).stream()
     for d in docs:
         firestore_client.collection("interactions").document(d.id).delete()
+
+def signup_email_password(email, password):
+    try:
+        return auth_client.create_user_with_email_and_password(email, password)
+    except Exception as e:
+        if "EMAIL_EXISTS" in str(e):
+            st.warning("This email is already registered. Please sign in instead.")
+        else:
+            st.error(f"Signup failed: {e}")
+        return None
