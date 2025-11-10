@@ -469,7 +469,7 @@ def login_ui():
                         st.error("This account is disabled.")
                     else:
                         st.error(f"Login failed. {e}")
-   with c2:
+    with c2:
     if st.button("Create account", use_container_width=True):
         st.session_state.pop("signup_message", None)  # 🧹 clear old messages
         if not email or not pwd:
@@ -486,6 +486,8 @@ def login_ui():
                 else:
                     st.session_state["signup_message"] = "error"
                     st.error(f"Signup failed: {e}")
+
+
 
 # -------------------- Pages --------------------
 def page_home():
