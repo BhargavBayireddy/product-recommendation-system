@@ -469,18 +469,23 @@ def login_ui():
                         st.error("This account is disabled.")
                     else:
                         st.error(f"Login failed. {e}")
-    with c2:
-        if st.button("Create account", use_container_width=True):
-            if not email or not pwd:
-                st.warning("Enter email & password, then click Create account.")
-            else:
-                try:
-                    signup_email_password(email, pwd)
-                    st.success("Account created. Now click Sign in.")
-                except Exception as e:
+   with c2:
+    if st.button("Create account", use_container_width=True):
+        st.session_state.pop("signup_message", None)  # 🧹 clear old messages
+        if not email or not pwd:
+            st.warning("Enter email & password, then click Create account.")
+        else:
+            try:
+                user = signup_email_password(email, pwd)
+                st.session_state["signup_message"] = "success"
+                st.success("Account created. Now click Sign in.")
+            except Exception as e:
+                if "EMAIL_EXISTS" in str(e):
+                    st.session_state["signup_message"] = "exists"
+                    st.warning("This email is already registered. Please sign in instead.")
+                else:
+                    st.session_state["signup_message"] = "error"
                     st.error(f"Signup failed: {e}")
-
-    st.caption("No guest access. You must sign in to view recommendations.")
 
 # -------------------- Pages --------------------
 def page_home():
