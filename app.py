@@ -1,4 +1,4 @@
-# app.py  — ReccoVerse (Option A: full-screen cinematic login)
+# app.py — ReccoVerse (full-screen cinematic login, fixed auth flow)
 import os, json, time, hashlib
 from pathlib import Path
 from datetime import datetime
@@ -25,7 +25,7 @@ ART.mkdir(exist_ok=True)
 ITEMS_CSV = ART / "items_snapshot.csv"
 CSS_FILE  = BASE / "ui.css"
 
-# ✅ Inject CSS only once
+# Inject CSS once
 if CSS_FILE.exists():
     st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
 
@@ -35,7 +35,7 @@ try:
     from firebase_init import (
         signup_email_password, login_email_password,
         add_interaction, fetch_user_interactions, ensure_user,
-        remove_interaction, fetch_global_interactions
+        remove_interaction, fetch_global_interactions,
     )
 except Exception as e:
     USE_FIREBASE = False
@@ -68,17 +68,19 @@ def _local_write(uid, item_id, action):
     LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 def _local_delete(uid, item_id, action):
-    if not LOCAL_STORE.exists(): return
+    if not LOCAL_STORE.exists():
+        return
     try:
         data = json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}")
     except Exception:
         return
     arr = data.get(uid, [])
-    data[uid] = [x for x in arr if not (x.get("item_id")==item_id and x.get("action")==action)]
+    data[uid] = [x for x in arr if not (x.get("item_id") == item_id and x.get("action") == action)]
     LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 def _local_read(uid):
-    if not LOCAL_STORE.exists(): return []
+    if not LOCAL_STORE.exists():
+        return []
     try:
         data = json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}")
         return data.get(uid, [])
@@ -88,7 +90,8 @@ def _local_read(uid):
 # -------------------- Data bootstrap --------------------
 @st.cache_data
 def _build_items_if_missing():
-    if ITEMS_CSV.exists(): return
+    if ITEMS_CSV.exists():
+        return
     try:
         import data_real
         data_real.build()
@@ -106,7 +109,7 @@ def _build_items_if_missing():
 def load_items() -> pd.DataFrame:
     _build_items_if_missing()
     df = pd.read_csv(ITEMS_CSV)
-    for c in ["item_id","name","domain","category","mood","goal"]:
+    for c in ["item_id", "name", "domain", "category", "mood", "goal"]:
         if c not in df.columns:
             df[c] = ""
     df["item_id"] = df["item_id"].astype(str).str.strip()
@@ -125,7 +128,8 @@ ITEM_EMBS, I2I, BACKEND = load_item_embeddings(items=ITEMS, artifacts_dir=ART)
 def save_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
-            add_interaction(uid, item_id, action); return
+            add_interaction(uid, item_id, action)
+            return
         except Exception as e:
             st.warning(f"Cloud write failed, storing offline. ({e})")
     _local_write(uid, item_id, action)
@@ -133,7 +137,8 @@ def save_interaction(uid, item_id, action):
 def delete_interaction(uid, item_id, action):
     if USE_FIREBASE:
         try:
-            remove_interaction(uid, item_id, action); return
+            remove_interaction(uid, item_id, action)
+            return
         except Exception as e:
             st.warning(f"Cloud delete failed, removing offline. ({e})")
     _local_delete(uid, item_id, action)
@@ -155,7 +160,8 @@ def read_interactions(uid):
     return out
 
 def read_global_interactions(limit=2000):
-    if not USE_FIREBASE: return []
+    if not USE_FIREBASE:
+        return []
     try:
         return fetch_global_interactions(limit=limit)
     except Exception:
@@ -164,7 +170,7 @@ def read_global_interactions(limit=2000):
 # -------------------- Recommendation helpers --------------------
 def user_has_history(uid) -> bool:
     inter = read_interactions(uid)
-    return any(a.get("action") in ("like","bag") for a in inter)
+    return any(a.get("action") in ("like", "bag") for a in inter)
 
 def user_vector(uid):
     inter = read_interactions(uid)
@@ -182,25 +188,30 @@ def _parse_ts(ts_str):
 def collaborative_candidates_aggressive(uid, top_k=12):
     my = read_interactions(uid)
     my_likes = {x["item_id"] for x in my if x.get("action") == "like"}
-    if not my_likes: return pd.DataFrame()
+    if not my_likes:
+        return pd.DataFrame()
 
     global_events = read_global_interactions(limit=4000)
-    if not global_events: return pd.DataFrame()
+    if not global_events:
+        return pd.DataFrame()
 
     similar_uids = {
         e.get("uid") for e in global_events
         if e.get("action") == "like" and e.get("item_id") in my_likes and e.get("uid") != uid
     }
-    if not similar_uids: return pd.DataFrame()
+    if not similar_uids:
+        return pd.DataFrame()
 
     candidate_items = {
         e.get("item_id") for e in global_events
         if e.get("action") == "like" and e.get("uid") in similar_uids
     }
-    if not candidate_items: return pd.DataFrame()
+    if not candidate_items:
+        return pd.DataFrame()
 
     df = ITEMS[ITEMS["item_id"].isin(candidate_items)].copy()
-    if df.empty: return df
+    if df.empty:
+        return df
 
     uvec = user_vector(uid)
     scores = score_items(uvec)
@@ -240,7 +251,7 @@ def recommend(uid, k=48):
     top_all = df.sort_values("score", ascending=False)
 
     inter = read_interactions(uid)
-    liked_ids = [x["item_id"] for x in inter if x.get("action")=="like"]
+    liked_ids = [x["item_id"] for x in inter if x.get("action") == "like"]
     liked_df = df[df["item_id"].isin(liked_ids)].copy()
     because = df.copy()
     if not liked_df.empty:
@@ -254,10 +265,12 @@ def recommend(uid, k=48):
     if collab is None or collab.empty or "item_id" not in collab.columns:
         collab = pd.DataFrame(columns=["item_id","name","domain","category","mood","goal","score"])
 
-    return (top_all.head(k),
-            collab.head(12),
-            because.head(min(k, 24)),
-            explore.head(min(k, 24)))
+    return (
+        top_all.head(k),
+        collab.head(12),
+        because.head(min(k, 24)),
+        explore.head(min(k, 24)),
+    )
 
 # -------------------- UI helpers --------------------
 CHEESE = [
@@ -280,7 +293,8 @@ def pill(dom: str) -> str:
     return f'<span class="pill">{dom.title()}</span>'
 
 def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "", show_cheese: bool=False, allow_remove=False):
-    if df is None or len(df) == 0: return
+    if df is None or len(df) == 0:
+        return
     st.markdown(f'<div class="rowtitle">{title}</div>', unsafe_allow_html=True)
     if subtitle:
         st.markdown(f'<div class="subtitle">{subtitle}</div>', unsafe_allow_html=True)
@@ -292,10 +306,8 @@ def card_row(df: pd.DataFrame, section_key: str, title: str, subtitle: str = "",
         with col:
             dom_class = "nf" if row["domain"]=="netflix" else ("az" if row["domain"]=="amazon" else ("sp" if row["domain"]=="spotify" else "xx"))
             st.markdown(f'<div class="card textonly {dom_class}">', unsafe_allow_html=True)
-
             st.markdown(f'<div class="name">{row["name"]}</div>', unsafe_allow_html=True)
             st.markdown(f'<div class="cap">{row["category"].title()} · {pill(row["domain"])}</div>', unsafe_allow_html=True)
-
             if show_cheese:
                 st.markdown(f'<div class="tagline">{cheesy_line(row["item_id"], row["name"], row["domain"])}</div>', unsafe_allow_html=True)
 
@@ -422,10 +434,12 @@ def _parse_firebase_error(msg: str) -> str:
         return "rate_limited"
     if "USER_DISABLED" in s:
         return "disabled"
+    if "EMAIL_EXISTS" in s:
+        return "exists"
     return "generic"
 
 def login_ui():
-    # Animated background layers (Option A – cinematic full-screen)
+    # animated layers
     st.markdown("""
     <div class="hero"></div>
     <div class="parallax"></div>
@@ -435,8 +449,7 @@ def login_ui():
 
     st.title("ReccoVerse")
     if not USE_FIREBASE:
-        st.error("This deployment requires Firebase. Import failed.\n\n"
-                 "Please ensure Streamlit Secrets contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
+        st.error("This deployment requires Firebase. Import failed.\n\nPlease ensure Streamlit Secrets contain FIREBASE_WEB_CONFIG and FIREBASE_SERVICE_ACCOUNT.")
         if 'FB_IMPORT_ERR' in globals():
             st.code(FB_IMPORT_ERR)
         st.stop()
@@ -444,7 +457,10 @@ def login_ui():
     st.subheader("Sign in to continue")
     email = st.text_input("Email")
     pwd   = st.text_input("Password", type="password")
+
     c1, c2 = st.columns(2)
+
+    # --- Sign in ---
     with c1:
         if st.button("Sign in", use_container_width=True, type="primary"):
             if not email or not pwd:
@@ -452,7 +468,7 @@ def login_ui():
             else:
                 try:
                     raw = login_email_password(email, pwd)
-                    user = json.loads(json.dumps(raw))  # ✅ Fix AttrDict to JSON
+                    user = json.loads(json.dumps(raw))  # normalize (e.g., AttrDict -> dict)
                     st.session_state["uid"] = user["localId"]
                     st.session_state["email"] = email
                     ensure_user(st.session_state["uid"], email=email)
@@ -469,25 +485,23 @@ def login_ui():
                         st.error("This account is disabled.")
                     else:
                         st.error(f"Login failed. {e}")
+
+    # --- Create account (single-message logic) ---
     with c2:
-    if st.button("Create account", use_container_width=True):
-        st.session_state.pop("signup_message", None)  # 🧹 clear old messages
-        if not email or not pwd:
-            st.warning("Enter email & password, then click Create account.")
-        else:
-            try:
-                user = signup_email_password(email, pwd)
-                st.session_state["signup_message"] = "success"
-                st.success("Account created. Now click Sign in.")
-            except Exception as e:
-                if "EMAIL_EXISTS" in str(e):
-                    st.session_state["signup_message"] = "exists"
-                    st.warning("This email is already registered. Please sign in instead.")
-                else:
-                    st.session_state["signup_message"] = "error"
-                    st.error(f"Signup failed: {e}")
+        if st.button("Create account", use_container_width=True):
+            if not email or not pwd:
+                st.warning("Enter email & password, then click Create account.")
+            else:
+                try:
+                    signup_email_password(email, pwd)
+                    st.success("Account created. Now click Sign in.")
+                except Exception as e:
+                    if _parse_firebase_error(str(e)) == "exists":
+                        st.warning("This email is already registered. Please sign in instead.")
+                    else:
+                        st.error(f"Signup failed: {e}")
 
-
+    st.caption("No guest access. You must sign in to view recommendations.")
 
 # -------------------- Pages --------------------
 def page_home():
@@ -496,6 +510,7 @@ def page_home():
     if live:
         enable_auto_refresh(5)
 
+    # search
     q = st.text_input("Search anything (name, domain, category, mood)...").strip()
     if q:
         qlow = q.lower()
