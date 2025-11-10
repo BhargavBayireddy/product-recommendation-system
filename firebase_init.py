@@ -1,54 +1,91 @@
 import json
-import firebase_admin
-from firebase_admin import credentials, firestore, auth
-import pyrebase
-import time
-
-# ---- Load secrets from Streamlit ----
 import streamlit as st
-FB_WEB = st.secrets["FIREBASE_WEB_CONFIG"]
-FB_SA  = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
+import pyrebase
+import firebase_admin
+from firebase_admin import credentials, auth, firestore
 
-# ---- Init Pyrebase (Auth + Realtime DB if needed) ----
-pb = pyrebase.initialize_app(FB_WEB)
-pb_auth = pb.auth()
+# ---------------- FIREBASE WEB CONFIG ----------------
+try:
+    web_config_raw = st.secrets["FIREBASE_WEB_CONFIG"]
+    # Parse JSON string → Python dict
+    FIREBASE_WEB_CONFIG = json.loads(web_config_raw) if isinstance(web_config_raw, str) else web_config_raw
+except Exception as e:
+    st.error(f"Firebase web config missing or invalid: {e}")
+    raise
 
-# ---- Init Admin SDK (Firestore) ----
-if not firebase_admin._apps:
-    cred = credentials.Certificate(json.loads(json.dumps(FB_SA)))
-    firebase_admin.initialize_app(cred)
-db = firestore.client()
+# ---------------- FIREBASE SERVICE ACCOUNT ----------------
+try:
+    svc_raw = st.secrets["FIREBASE_SERVICE_ACCOUNT"]
+    FIREBASE_SERVICE_ACCOUNT = json.loads(svc_raw) if isinstance(svc_raw, str) else svc_raw
+except Exception as e:
+    st.error(f"Firebase service account missing or invalid: {e}")
+    raise
 
-# ================================
-#  AUTH HELPERS
-# ================================
+# ---------------- INITIALIZE CLIENTS ----------------
+try:
+    firebase = pyrebase.initialize_app(FIREBASE_WEB_CONFIG)
+    auth_client = firebase.auth()
+    db = firebase.database()
+except Exception as e:
+    st.error(f"Pyrebase init failed: {e}")
+    raise
+
+try:
+    if not firebase_admin._apps:
+        cred = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+        firebase_admin.initialize_app(cred)
+    firestore_client = firestore.client()
+except Exception as e:
+    st.warning(f"Firebase Admin init failed: {e}")
+    firestore_client = None
+
+
+# ---------------- AUTH HELPERS ----------------
 def signup_email_password(email, password):
-    return pb_auth.create_user_with_email_and_password(email, password)
+    """Sign up new user."""
+    return auth_client.create_user_with_email_and_password(email, password)
 
 def login_email_password(email, password):
-    return pb_auth.sign_in_with_email_and_password(email, password)
+    """Login user."""
+    return auth_client.sign_in_with_email_and_password(email, password)
 
-def ensure_user(uid, email=None):
-    ref = db.collection("users").document(uid)
-    if not ref.get().exists:
-        ref.set({"email": email, "created": time.time()})
+def ensure_user(uid, email):
+    """Ensure user doc exists in Firestore."""
+    if firestore_client is None:
+        return
+    doc_ref = firestore_client.collection("users").document(uid)
+    if not doc_ref.get().exists:
+        doc_ref.set({"email": email, "created_at": firestore.SERVER_TIMESTAMP})
 
-# ================================
-#  INTERACTIONS (likes, bag, etc)
-# ================================
 def add_interaction(uid, item_id, action):
-    ev = {"uid": uid, "item_id": item_id, "action": action, "ts": time.time()}
-    db.collection("interactions").add(ev)
-
-def remove_interaction(uid, item_id, action):
-    q = db.collection("interactions").where("uid", "==", uid).where("item_id", "==", item_id).where("action", "==", action)
-    for doc in q.get():
-        doc.reference.delete()
+    """Store a like/bag action."""
+    if firestore_client is None:
+        return
+    firestore_client.collection("interactions").add({
+        "uid": uid,
+        "item_id": item_id,
+        "action": action,
+        "ts": firestore.SERVER_TIMESTAMP
+    })
 
 def fetch_user_interactions(uid):
-    q = db.collection("interactions").where("uid", "==", uid).get()
-    return [x.to_dict() for x in q]
+    """Fetch all user interactions."""
+    if firestore_client is None:
+        return []
+    docs = firestore_client.collection("interactions").where("uid", "==", uid).stream()
+    return [{"item_id": d.to_dict()["item_id"], "action": d.to_dict()["action"], "ts": d.to_dict()["ts"].isoformat()} for d in docs]
 
 def fetch_global_interactions(limit=2000):
-    q = db.collection("interactions").order_by("ts", direction=firestore.Query.DESCENDING).limit(limit).get()
-    return [x.to_dict() for x in q]
+    """Fetch global interactions."""
+    if firestore_client is None:
+        return []
+    docs = firestore_client.collection("interactions").limit(limit).stream()
+    return [d.to_dict() for d in docs]
+
+def remove_interaction(uid, item_id, action):
+    """Remove interaction."""
+    if firestore_client is None:
+        return
+    docs = firestore_client.collection("interactions").where("uid", "==", uid).where("item_id", "==", item_id).where("action", "==", action).stream()
+    for d in docs:
+        firestore_client.collection("interactions").document(d.id).delete()
