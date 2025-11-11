@@ -1,333 +1,328 @@
-# app.py — ReccoVerse (stable auth, live likes, cold-start MMR recommendations)
-import os, json, time, hashlib
+# app.py — ReccoVerse (cinematic AI-powered hybrid recommender)
+# Version: Multi-domain online dataset (Movies + Music + Beauty)
+# Run locally: streamlit run app.py
+
+import os, io, json, time, zipfile, gzip, hashlib, random, requests
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
-import plotly.express as px
 
-st.set_page_config(page_title="ReccoVerse", layout="wide")
+from firebase_init import (
+    signup_email_password,
+    login_email_password,
+    add_interaction,
+    fetch_user_interactions,
+    fetch_global_interactions,
+    ensure_user,
+    FIREBASE_READY,
+)
 
-# ----------------------------- Paths & CSS -----------------------------
-BASE = Path(__file__).parent
-ART  = BASE / "artifacts"
-ART.mkdir(exist_ok=True)
+from gnn_infer import (
+    load_item_embeddings,
+    make_user_vector,
+    recommend_items,
+    diversity_personalization_novelty,
+    cold_start_mmr,
+)
 
-ITEMS_CSV = ART / "items_snapshot.csv"
-CSS_FILE  = BASE / "ui.css"
-if CSS_FILE.exists():
-    st.markdown(f"<style>{CSS_FILE.read_text()}</style>", unsafe_allow_html=True)
+# ---------- App Config ----------
+APP_NAME = "ReccoVerse"
+ART = Path("artifacts")
+REFRESH_MS = 5000
+CARD_COLS = 5
 
-# ----------------------------- Optional .env ---------------------------
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
 
-# ----------------------------- Firebase import ------------------------
-USE_FIREBASE = True
-try:
-    from firebase_init import (
-        signup_email_password, login_email_password,
-        add_interaction, fetch_user_interactions, ensure_user,
-        remove_interaction, fetch_global_interactions
+# ---------- Inject CSS ----------
+def inject_css():
+    css_path = Path("ui.css")
+    if css_path.exists():
+        st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+    else:
+        st.markdown(
+            """
+            <style>
+            body{background:#0b0e14;color:#e7e7ea;}
+            .recco-title{font-size:2.4rem;font-weight:900;letter-spacing:.02em;margin:1rem 0;}
+            .card{border-radius:14px;overflow:hidden;border:1px solid #1f2633;margin-bottom:10px;transition:all .2s ease;}
+            .card:hover{transform:scale(1.02);box-shadow:0 0 25px rgba(73,187,255,.1);}
+            .section-title{font-size:1.3rem;font-weight:800;margin-top:1rem;}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+inject_css()
+
+# ---------- Session State ----------
+def init_state():
+    ss = st.session_state
+    ss.setdefault("authed", False)
+    ss.setdefault("uid", None)
+    ss.setdefault("email", None)
+    ss.setdefault("items_df", None)
+    ss.setdefault("embeddings", None)
+    ss.setdefault("id_to_idx", None)
+    ss.setdefault("liked", set())
+    ss.setdefault("bag", set())
+
+init_state()
+
+# ---------- Multi-Domain Online Loader ----------
+@st.cache_data(show_spinner="Fetching multi-domain datasets (Movies, Music, Beauty)...")
+def load_multidomain_online():
+    frames = []
+
+    # 🎬 MOVIES — MovieLens
+    try:
+        mov_url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
+        with zipfile.ZipFile(io.BytesIO(requests.get(mov_url, timeout=10).content)) as z:
+            with z.open("ml-latest-small/movies.csv") as f:
+                movies = pd.read_csv(f)
+        frames.append(pd.DataFrame({
+            "item_id": "mv_" + movies["movieId"].astype(str),
+            "title": movies["title"],
+            "provider": "Netflix",
+            "genre": movies["genres"].str.split("|").str[0],
+            "image": "https://images.unsplash.com/photo-1496302662116-35cc4f36df92?q=80&w=1200",
+            "text": movies["title"] + " " + movies["genres"]
+        }).sample(200))
+    except Exception as e:
+        st.warning(f"Movies dataset load failed: {e}")
+
+    # 🎧 MUSIC — Last.fm open sample
+    try:
+        mus_url = "https://raw.githubusercontent.com/yg397/music-recommender-dataset/master/data.csv"
+        music = pd.read_csv(mus_url).dropna().sample(200)
+        frames.append(pd.DataFrame({
+            "item_id": "mu_" + music["artist"].astype(str) + "_" + music["track"].astype(str),
+            "title": music["track"],
+            "provider": "Spotify",
+            "genre": "Music",
+            "image": "https://images.unsplash.com/photo-1511379938547-c1f69419868d?q=80&w=1200",
+            "text": music["artist"] + " " + music["track"]
+        }))
+    except Exception as e:
+        st.warning(f"Music dataset load failed: {e}")
+
+    # 💄 BEAUTY PRODUCTS — Amazon subset
+    try:
+        beauty_url = "https://datarepo.s3.amazonaws.com/beauty_5.json.gz"
+        with gzip.open(io.BytesIO(requests.get(beauty_url, timeout=10).content)) as f:
+            lines = [json.loads(l) for l in f.readlines()[:2000]]
+        beauty = pd.DataFrame(lines)
+        frames.append(pd.DataFrame({
+            "item_id": "pr_" + beauty["asin"].astype(str),
+            "title": beauty["title"],
+            "provider": "Amazon",
+            "genre": "Beauty",
+            "image": "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?q=80&w=1200",
+            "text": beauty["title"] + " " + beauty.get("description", "").astype(str)
+        }).dropna().sample(200))
+    except Exception as e:
+        st.warning(f"Beauty dataset load failed: {e}")
+
+    all_df = pd.concat(frames, ignore_index=True)
+    all_df.drop_duplicates(subset=["title"], inplace=True)
+    st.success(f"Fetched {len(all_df)} items across {len(frames)} domains.")
+    return all_df
+
+# ---------- Auth UI ----------
+def splash_login():
+    st.markdown(
+        """
+        <div class="hero">
+            <div class="hero-inner">
+                <div class="brand-glow">ReccoVerse</div>
+                <div class="tagline">AI-curated picks across Movies • Music • Products</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-except Exception as e:
-    USE_FIREBASE = False
-    FB_IMPORT_ERR = str(e)
+    st.subheader("Sign In / Sign Up")
 
-# ----------------------------- Data bootstrap -------------------------
-@st.cache_data
-def _build_items_if_missing():
-    if ITEMS_CSV.exists(): return
-    try:
-        import data_real
-        data_real.build()
-    except Exception:
-        rows = [
-            {"item_id":"nf_0001","name":"Inception","domain":"netflix","category":"entertainment","mood":"engaged","goal":"engaged"},
-            {"item_id":"az_0001","name":"Noise Cancelling Headphones","domain":"amazon","category":"product","mood":"focus","goal":"focus"},
-            {"item_id":"sp_0001","name":"Bass Therapy","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
-            {"item_id":"sp_0002","name":"Lo-Fi Study Beats","domain":"spotify","category":"music","mood":"focus","goal":"focus"},
-            {"item_id":"nf_0002","name":"Sabrina","domain":"netflix","category":"entertainment","mood":"chill","goal":"relax"},
-        ]
-        pd.DataFrame(rows).to_csv(ITEMS_CSV, index=False)
+    col1, col2 = st.columns(2)
+    with col1:
+        with st.form("login"):
+            email = st.text_input("Email", key="login_email")
+            pwd = st.text_input("Password", type="password", key="login_pwd")
+            submitted = st.form_submit_button("Sign In")
+        if submitted:
+            ok, uid_or_msg = login_email_password(email, pwd)
+            if ok:
+                st.session_state.authed = True
+                st.session_state.uid = uid_or_msg
+                st.session_state.email = email
+                ensure_user(uid_or_msg, email)
+                st.success("Welcome back!")
+                st.experimental_rerun()
+            else:
+                st.error(uid_or_msg)
+    with col2:
+        with st.form("signup"):
+            email_up = st.text_input("New Email", key="signup_email")
+            pwd_up = st.text_input("New Password", type="password", key="signup_pwd")
+            submitted_up = st.form_submit_button("Create Account")
+        if submitted_up:
+            ok, uid_or_msg = signup_email_password(email_up, pwd_up)
+            if ok:
+                st.success("Account created! Please sign in.")
+            else:
+                st.error(uid_or_msg)
 
-@st.cache_data
-def load_items() -> pd.DataFrame:
-    _build_items_if_missing()
-    df = pd.read_csv(ITEMS_CSV)
-    for c in ["item_id","name","domain","category","mood","goal"]:
-        if c not in df.columns: df[c] = ""
-    df["item_id"] = df["item_id"].astype(str).str.strip()
-    df["name"]    = df["name"].astype(str).str.strip()
-    df["domain"]  = df["domain"].astype(str).str.strip().str.lower()
-    df["category"]= df["category"].astype(str).str.strip()
-    df = df.dropna(subset=["item_id","name","domain"]).drop_duplicates(subset=["item_id"]).reset_index(drop=True)
-    return df
+    st.caption(("Using " + ("Firebase" if FIREBASE_READY else "local mock")) + " backend.")
 
-# ----------------------------- Embeddings / GNN -----------------------
-from gnn_infer import load_item_embeddings, make_user_vector
+# ---------- Helper Buttons ----------
+def toggle_like(uid, item_id, action):
+    if action == "like":
+        st.session_state.liked.add(item_id)
+        add_interaction(uid, item_id, "like")
+    else:
+        st.session_state.liked.discard(item_id)
+        add_interaction(uid, item_id, "unlike")
 
-ITEMS = load_items()
-ITEM_EMBS, I2I, BACKEND = load_item_embeddings(items=ITEMS, artifacts_dir=ART)
+def toggle_bag(uid, item_id, action):
+    if action == "bag":
+        st.session_state.bag.add(item_id)
+        add_interaction(uid, item_id, "bag")
+    else:
+        st.session_state.bag.discard(item_id)
+        add_interaction(uid, item_id, "remove_bag")
 
-# ----------------------------- Local fallback store -------------------
-LOCAL_STORE = BASE / ".local_interactions.json"
+def render_item_card(row, liked, bagged, uid):
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.image(row["image"], use_column_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(f"**{row['title']}**")
+        st.caption(f"{row['provider']} • {row['genre']}")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(("❤️ Liked" if liked else "♡ Like"), key=f"like_{row.item_id}"):
+                toggle_like(uid, row.item_id, "unlike" if liked else "like")
+                st.experimental_rerun()
+        with c2:
+            if st.button(("👜 In Bag" if bagged else "➕ Add"), key=f"bag_{row.item_id}"):
+                toggle_bag(uid, row.item_id, "remove_bag" if bagged else "bag")
+                st.experimental_rerun()
 
-def _local_upsert(uid: str, item_id: str, action: str, ts=None):
-    ts = float(ts or time.time())
-    LOCAL_STORE.touch(exist_ok=True)
-    try:
-        data = json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}")
-    except Exception:
-        data = {}
-    arr = data.setdefault(uid, [])
-    arr = [x for x in arr if not (x.get("item_id")==item_id and x.get("action")==action)]
-    arr.append({"ts": ts, "item_id": item_id, "action": action})
-    data[uid] = arr
-    LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-def _local_delete(uid: str, item_id: str, action: str):
-    if not LOCAL_STORE.exists(): return
-    try:
-        data = json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}")
-    except Exception:
+def section_grid(title, items_df, ids, uid):
+    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+    if not ids:
+        st.info("No items yet.")
         return
-    arr = data.get(uid, [])
-    data[uid] = [x for x in arr if not (x.get("item_id")==item_id and x.get("action")==action)]
-    LOCAL_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    cols = st.columns(CARD_COLS)
+    for i, iid in enumerate(ids[:CARD_COLS * 2]):
+        row = items_df[items_df.item_id == iid].iloc[0]
+        with cols[i % CARD_COLS]:
+            render_item_card(row, iid in st.session_state.liked, iid in st.session_state.bag, uid)
 
-def _local_read(uid: str) -> List[Dict[str, Any]]:
-    if not LOCAL_STORE.exists(): return []
-    try:
-        return json.loads(LOCAL_STORE.read_text(encoding="utf-8") or "{}").get(uid, [])
-    except Exception:
-        return []
+# ---------- Main Pages ----------
+def ensure_embeddings_loaded():
+    if st.session_state.items_df is None or st.session_state.embeddings is None:
+        items_online = load_multidomain_online()
+        items_df, embs, id_to_idx, A = load_item_embeddings(items=items_online, artifacts_dir=ART)
+        st.session_state.items_df = items_df
+        st.session_state.embeddings = embs
+        st.session_state.id_to_idx = id_to_idx
+        st.session_state.A = A
 
-# ----------------------------- IO wrappers ----------------------------
-def save_interaction(uid: str, item_id: str, action: str):
-    wrote = False
-    if USE_FIREBASE:
-        try:
-            add_interaction(uid, item_id, action)
-            wrote = True
-        except Exception as e:
-            st.toast(f"Cloud write failed; cached offline. ({e})", icon="⚠️")
-    if not wrote:
-        _local_upsert(uid, item_id, action)
+def page_home(uid):
+    st.markdown(f"<div class='recco-title'>{APP_NAME}</div>", unsafe_allow_html=True)
+    st.caption(f"Logged in as **{st.session_state.email}**")
 
-def delete_interaction(uid: str, item_id: str, action: str):
-    removed = False
-    if USE_FIREBASE:
-        try:
-            remove_interaction(uid, item_id, action)
-            removed = True
-        except Exception as e:
-            st.toast(f"Cloud delete failed; cleaned offline. ({e})", icon="⚠️")
-    if not removed:
-        _local_delete(uid, item_id, action)
+    ensure_embeddings_loaded()
+    items_df = st.session_state.items_df
+    embs = st.session_state.embeddings
+    id2idx = st.session_state.id_to_idx
+    A = st.session_state.A
 
-def _parse_ts(ts_str):
-    try:
-        return datetime.fromisoformat(str(ts_str).replace("Z","")).timestamp()
-    except Exception:
-        return 0.0
+    interactions = fetch_user_interactions(uid)
+    st.session_state.liked = set([x["item_id"] for x in interactions if x["action"] == "like"])
+    st.session_state.bag = set([x["item_id"] for x in interactions if x["action"] == "bag"])
 
-def read_interactions(uid: str) -> List[Dict[str, Any]]:
-    cloud = []
-    if USE_FIREBASE:
-        try:
-            cloud = fetch_user_interactions(uid)
-        except Exception:
-            cloud = []
-    local = _local_read(uid)
-    allx = (cloud or []) + (local or [])
-    keep: Dict[Tuple[str,str], Dict[str,Any]] = {}
-    for e in allx:
-        k = (e.get("item_id"), e.get("action"))
-        ts = e.get("ts", 0.0)
-        if isinstance(ts, str): ts = _parse_ts(ts)
-        if k not in keep or ts > keep[k].get("ts", 0.0):
-            e["ts"] = ts
-            keep[k] = e
-    out = list(keep.values())
-    out.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
-    return out
+    user_vec = make_user_vector(st.session_state.liked, st.session_state.bag, id2idx, embs)
 
-def read_global_interactions(limit=4000):
-    if not USE_FIREBASE: return []
-    try:
-        return fetch_global_interactions(limit=limit)
-    except Exception:
-        return []
+    top_picks = recommend_items(user_vec, embs, items_df, exclude=set(st.session_state.liked), topk=15, A=A)
+    crowd = fetch_global_interactions(limit=300)
+    ppl_like_you = recommend_items(user_vec, embs, items_df, topk=12, A=A, crowd=crowd)
+    because_similar = recommend_items(user_vec, embs, items_df, topk=12, A=A, force_content=True)
+    cold = cold_start_mmr(items_df, embs, lambda_=0.65, k=12)
 
-# ----------------------------- Recommendation logic -------------------
-def _cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return float((a @ b) / ((np.linalg.norm(a)+1e-9)*(np.linalg.norm(b)+1e-9)))
+    section_grid("Top Picks For You", items_df, top_picks, uid)
+    section_grid("People Like You Also Liked", items_df, ppl_like_you, uid)
+    section_grid("Because You Liked Similar Items", items_df, because_similar, uid)
+    section_grid("Explore Something Different", items_df, cold, uid)
 
-def _mmr_rank(candidates_idx: np.ndarray, query_vec: np.ndarray,
-              lambda_sim: float = 0.65, k: int = 24) -> List[int]:
-    E = ITEM_EMBS[candidates_idx]
-    q = query_vec / (np.linalg.norm(query_vec)+1e-9)
-    sims = (E @ q)
-    chosen, remaining = [], set(range(len(candidates_idx)))
-    while remaining and len(chosen) < k:
-        best, best_score = None, -1e9
-        for i in list(remaining):
-            div = 0.0
-            if chosen:
-                div = np.max(E[chosen] @ (E[i] / (np.linalg.norm(E[i])+1e-9)))
-            score = lambda_sim * sims[i] - (1 - lambda_sim) * div
-            if score > best_score:
-                best, best_score = i, score
-        chosen.append(best)
-        remaining.remove(best)
-    return [candidates_idx[i] for i in chosen]
+    st.autorefresh(interval=REFRESH_MS, key="auto_refresh_home")
 
-def user_vector(uid: str) -> np.ndarray:
-    inter = read_interactions(uid)
-    return make_user_vector(interactions=inter, iid2idx=I2I, item_embs=ITEM_EMBS)
+def page_liked(uid):
+    st.markdown("<div class='recco-title'>Liked Items</div>", unsafe_allow_html=True)
+    ensure_embeddings_loaded()
+    section_grid("Your ❤️ Likes", st.session_state.items_df, list(st.session_state.liked), uid)
 
-def _scores_for_all(uvec: np.ndarray) -> np.ndarray:
-    return (ITEM_EMBS @ (uvec / (np.linalg.norm(uvec)+1e-9))).flatten()
+def page_bag(uid):
+    st.markdown("<div class='recco-title'>Your Bag</div>", unsafe_allow_html=True)
+    ensure_embeddings_loaded()
+    section_grid("Saved for Later", st.session_state.items_df, list(st.session_state.bag), uid)
 
-def recommend(uid: str, k: int = 48):
-    df = ITEMS.copy()
-    inter = read_interactions(uid)
-    liked_ids = [x["item_id"] for x in inter if x.get("action") == "like"]
+def page_compare(uid):
+    st.markdown("<div class='recco-title'>Compare Engines</div>", unsafe_allow_html=True)
+    ensure_embeddings_loaded()
+    items_df = st.session_state.items_df
+    embs = st.session_state.embeddings
+    id2idx = st.session_state.id_to_idx
+    A = st.session_state.A
+    user_vec = make_user_vector(st.session_state.liked, st.session_state.bag, id2idx, embs)
 
-    uvec = user_vector(uid)
-    scores = _scores_for_all(uvec)
+    rec_personal = recommend_items(user_vec, embs, items_df, topk=12, A=A)
+    rec_pop = [r for r in items_df.sample(frac=1, random_state=3).item_id.tolist()[:12]]
+    rec_rand = [r for r in items_df.sample(frac=1, random_state=7).item_id.tolist()[:12]]
 
-    idx_series = df["item_id"].map(I2I)
-    mask = idx_series.notna().to_numpy()
-    aligned = np.full(len(df), float(scores.mean()), dtype=float)
-    if mask.any():
-        aligned[mask] = scores[idx_series[mask].astype(int).to_numpy()]
-    df["score"] = aligned
+    def bundle(ids): return items_df[items_df.item_id.isin(ids)]
+    p_div, p_per, p_nov = diversity_personalization_novelty(bundle(rec_personal), user_vec, embs, id2idx)
+    o_div, o_per, o_nov = diversity_personalization_novelty(bundle(rec_pop), user_vec, embs, id2idx)
+    r_div, r_per, r_nov = diversity_personalization_novelty(bundle(rec_rand), user_vec, embs, id2idx)
 
-    if not liked_ids:
-        q = ITEM_EMBS.mean(axis=0)
-        cand_idx = np.array([I2I[i] for i in df["item_id"] if i in I2I], dtype=int)
-        pick_idx = _mmr_rank(cand_idx, q, 0.65, min(48, len(cand_idx)))
-        cold_df = df.iloc[[int(np.where(cand_idx==p)[0][0]) for p in pick_idx]].copy()
-        return cold_df, pd.DataFrame(), cold_df.head(24), df.sample(min(k,len(df)))
+    labels = ["Diversity", "Personalization", "Novelty"]
+    fig = go.Figure()
+    fig.add_bar(name="Quanta-GNN", x=labels, y=[p_div,p_per,p_nov])
+    fig.add_bar(name="Popularity", x=labels, y=[o_div,o_per,o_nov])
+    fig.add_bar(name="Random", x=labels, y=[r_div,r_per,r_nov])
+    fig.update_layout(barmode="group", height=420, margin=dict(l=20,r=20,t=20,b=20))
+    st.plotly_chart(fig, use_container_width=True)
 
-    top_all = df.sort_values("score", ascending=False).head(k)
-    liked_df = df[df["item_id"].isin(liked_ids)].copy()
-    doms = liked_df["domain"].value_counts().index.tolist()
-    because = df[df["domain"].isin(doms)].sort_values("score", ascending=False).head(min(k, 24))
-    explore = df.sort_values("score", ascending=True).head(min(k, 24))
-    return top_all, pd.DataFrame(), because, explore
+# ---------- Navbar ----------
+def navbar():
+    st.sidebar.markdown("### ReccoVerse")
+    page = st.sidebar.radio("Navigation", ["Home", "Liked Items", "Bag", "Compare"])
+    if st.sidebar.button("Sign Out"):
+        for k in ["authed","uid","email","liked","bag"]:
+            st.session_state[k] = None if k in ["uid","email"] else False if k=="authed" else set()
+        st.experimental_rerun()
+    return page
 
-# ----------------------------- UI helpers -----------------------------
-CHEESE = ["Hot pick. Zero regrets.","Tiny click. Big vibe.","Your next favorite, probably.","Chef's kiss material.","Trust the vibes.","Mood booster approved."]
-
-def cheesy_line(item_id, name, domain):
-    h = int(hashlib.md5((item_id+name+domain).encode()).hexdigest(),16)
-    return CHEESE[h % len(CHEESE)]
-
-def pill(dom):
-    d = dom.lower()
-    if d=="netflix": return '<span class="pill nf">Netflix</span>'
-    if d=="amazon": return '<span class="pill az">Amazon</span>'
-    if d=="spotify": return '<span class="pill sp">Spotify</span>'
-    return f'<span class="pill">{dom.title()}</span>'
-
-def card_row(df, section, title):
-    if df.empty: return
-    st.markdown(f'<div class="rowtitle">{title}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="scroller">', unsafe_allow_html=True)
-    cols = st.columns(min(6, len(df)), gap="small")
-    for i, (_, r) in enumerate(df.iterrows()):
-        col = cols[i % len(cols)]
-        with col:
-            st.markdown(f'<div class="card textonly"><div class="name">{r["name"]}</div><div class="cap">{r["category"].title()} · {pill(r["domain"])}</div></div>', unsafe_allow_html=True)
-            c1, c2 = st.columns(2)
-            if c1.button("♥ Like", key=f"{section}_like_{r['item_id']}"):
-                save_interaction(st.session_state["uid"], r["item_id"], "like"); st.rerun()
-            if c2.button("👜 Bag", key=f"{section}_bag_{r['item_id']}"):
-                save_interaction(st.session_state["uid"], r["item_id"], "bag"); st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ----------------------------- Auth ----------------------------------
-def _parse_firebase_error(msg):
-    s=str(msg)
-    if "EMAIL_NOT_FOUND" in s: return "not_found"
-    if "INVALID_PASSWORD" in s: return "bad_password"
-    if "EMAIL_EXISTS" in s: return "exists"
-    return "generic"
-
-def login_ui():
-    st.title("ReccoVerse")
-    if not USE_FIREBASE:
-        st.error("Firebase import failed. Check secrets.")
-        st.stop()
-    email=st.text_input("Email")
-    pwd=st.text_input("Password",type="password")
-    c1,c2=st.columns(2)
-    with c1:
-        if st.button("Sign in", use_container_width=True):
-            try:
-                raw=login_email_password(email,pwd)
-                user=json.loads(json.dumps(raw))
-                st.session_state["uid"]=user["localId"]
-                st.session_state["email"]=email
-                ensure_user(st.session_state["uid"],email=email)
-                st.rerun()
-            except Exception as e:
-                st.error(f"Login failed: {_parse_firebase_error(e)}")
-    with c2:
-        if st.button("Create account", use_container_width=True):
-            try:
-                signup_email_password(email,pwd)
-                st.success("Account created. Now click Sign in.")
-            except Exception as e:
-                st.error(f"Signup failed: {_parse_firebase_error(e)}")
-
-# ----------------------------- Pages ---------------------------------
-def page_home():
-    q=st.text_input("Search anything...").strip()
-    if q:
-        df=ITEMS[ITEMS.apply(lambda r:q.lower() in str(r).lower(),axis=1)]
-        if df.empty: st.warning("No matches."); return
-        card_row(df.head(24),"search",f"Search results for '{q}'"); st.divider()
-    top,_,because,explore=recommend(st.session_state["uid"],48)
-    card_row(top.head(12),"top","Top picks for you")
-    card_row(because.head(12),"because","Because you liked similar things")
-    card_row(explore.head(12),"explore","Explore something different")
-
-def page_liked():
-    inter=read_interactions(st.session_state["uid"])
-    liked=[x["item_id"] for x in inter if x.get("action")=="like"]
-    if not liked: st.info("No likes yet."); return
-    df=ITEMS[ITEMS["item_id"].isin(liked)]
-    card_row(df,"liked","Your likes")
-
-def page_bag():
-    inter=read_interactions(st.session_state["uid"])
-    bag=[x["item_id"] for x in inter if x.get("action")=="bag"]
-    if not bag: st.info("Bag empty."); return
-    df=ITEMS[ITEMS["item_id"].isin(bag)]
-    card_row(df,"bag","Your bag")
-
-# ----------------------------- Main ----------------------------------
+# ---------- Entrypoint ----------
 def main():
-    if "uid" not in st.session_state:
-        login_ui(); return
-    st.sidebar.success(f"Logged in: {st.session_state.get('email')}")
-    if st.sidebar.button("Logout"):
-        for k in ["uid","email"]: st.session_state.pop(k,None)
-        st.rerun()
-    page=st.sidebar.radio("Go to",["Home","Liked","Bag"],index=0)
-    if page=="Home": page_home()
-    if page=="Liked": page_liked()
-    if page=="Bag": page_bag()
+    if not st.session_state.authed:
+        splash_login()
+        return
+    page = navbar()
+    uid = st.session_state.uid
+    if page == "Home":
+        page_home(uid)
+    elif page == "Liked Items":
+        page_liked(uid)
+    elif page == "Bag":
+        page_bag(uid)
+    elif page == "Compare":
+        page_compare(uid)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
