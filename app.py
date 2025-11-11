@@ -1,419 +1,404 @@
-import os, time, random, math, hashlib, json
-from typing import Dict, List, Tuple
-from functools import lru_cache
-
-import requests
-import pandas as pd
+import os, time, random, math, textwrap, functools
+from typing import List, Dict, Any
 import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
 
-# -------------------------
-# App constants & helpers
-# -------------------------
-APP_TITLE = "ReccoVerse"
-PRIMARY_GRADIENT = "linear-gradient(90deg, #19C3FB 0%, #7B2FF7 100%)"
-DARK_BG = "#0b1220"
-CARD_BG = "#0f172a"
-TEXT = "#E6EDF6"
-SUBTEXT = "#9FB0C1"
-ACCENT = "#7B2FF7"
+# ------------------------------
+# Config & Theme
+# ------------------------------
+st.set_page_config(page_title="ReccoVerse", page_icon="🎬", layout="wide")
 
-def _ss(k, v):
-    if k not in st.session_state:
-        st.session_state[k] = v
+PRIMARY_GRADIENT = "linear-gradient(90deg, #26C6DA, #7C4DFF)"  # Fresh, not Jio/Hotstar colors
+BG_DARK = "#0B1220"
+CARD_BG = "#121A2B"
 
-def uid_of(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()[:10]
+APP_TITLE = """
+<style>
+body, .stApp { background: """ + BG_DARK + """; }
+h1,h2,h3,h4 { color: #EAF2FF; }
+.small { color:#9FB3D9; font-size:0.9rem; }
+.badge { background:#1F2A44; padding:4px 10px; border-radius:12px; color:#BFD1FF; }
+.gradbtn {
+  background: """ + PRIMARY_GRADIENT + """;
+  color: white; padding: 8px 16px; border-radius: 999px; border: none;
+}
+.card {
+  background: """ + CARD_BG + """;
+  border: 1px solid #1B2540; border-radius: 18px; padding: 14px;
+}
+.thumb { border-radius: 12px; object-fit: cover; }
+.metricbar {
+  height:10px; border-radius:8px; background:#12203C; overflow:hidden;
+}
+.metricbar > div { height:100%; background: """ + PRIMARY_GRADIENT + """; }
+.rowtitle { display:flex; align-items:center; gap:10px; }
+.rowtitle .emoji { font-size:1.3rem; }
+.searchbox input { color:#EAF2FF !important; }
+</style>
+"""
 
-# -------------------------
-# Styling
-# -------------------------
-st.set_page_config(page_title=APP_TITLE, page_icon="🎬", layout="wide")
-st.markdown(f"""
-    <style>
-        html, body, [class*="block-container"] {{
-            background: radial-gradient(1200px 600px at 20% 0%, #0d1730 0%, {DARK_BG} 35%, {DARK_BG} 100%) !important;
-            color: {TEXT};
-        }}
-        .title-hero {{
-            font-weight: 800; letter-spacing: .5px;
-            font-size: 40px; margin: 8px 0 24px 0;
-        }}
-        .row-title {{
-            font-weight: 700; font-size: 22px; margin: 16px 0 8px 0;
-        }}
-        .pill {{
-            padding: 6px 12px; border-radius: 999px; font-size: 12px; 
-            background: rgba(123,47,247,.12); color: #c8baff; border: 1px solid rgba(123,47,247,.35);
-            display: inline-flex; gap: 8px; align-items: center;
-        }}
-        .btn-grad {{
-            background: {PRIMARY_GRADIENT};
-            color: white; font-weight: 700; border: none; padding: 10px 16px; 
-            border-radius: 999px; box-shadow: 0 6px 22px rgba(123,47,247,.35);
-        }}
-        .card {{
-            background: {CARD_BG}; border: 1px solid #111a2e; border-radius: 16px; overflow: hidden;
-            transition: all .25s ease; position: relative;
-        }}
-        .card:hover {{ transform: translateY(-3px); box-shadow: 0 10px 26px rgba(0,0,0,.4); }}
-        .meta {{ color: {SUBTEXT}; font-size: 12px; }}
-        .nov-wrap {{ height: 8px; background: #111a2e; border-radius: 8px; overflow: hidden; }}
-        .nov-fill {{ height: 8px; background: {PRIMARY_GRADIENT}; }}
-        .searchbox input {{
-            background: #0f1528 !important; color: {TEXT} !important; border: 1px solid #223254 !important;
-        }}
-        .sidebar .stButton>button {{
-            background: {PRIMARY_GRADIENT}; color: white; border: 0; border-radius: 999px; font-weight: 700;
-        }}
-    </style>
-""", unsafe_allow_html=True)
+st.markdown(APP_TITLE, unsafe_allow_html=True)
 
-# -------------------------
-# Secrets & tokens
-# -------------------------
-SPOTIFY_CLIENT_ID = st.secrets.get("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = st.secrets.get("SPOTIFY_CLIENT_SECRET", "")
-TMDB_API_KEY = st.secrets.get("TMDB_API_KEY", "")
+# ------------------------------
+# Secrets / Keys
+# ------------------------------
+TMDB_KEY = st.secrets.get("TMDB_API_KEY")
+SPOTIFY_ID = st.secrets.get("SPOTIFY_CLIENT_ID")
+SPOTIFY_SECRET = st.secrets.get("SPOTIFY_CLIENT_SECRET")
 
-# -------------------------
-# Session State
-# -------------------------
-_ss("liked_ids", set())
-_ss("bag_ids", set())
-_ss("surprise", False)
-_ss("search", "")
-_ss("user_profile", {"uid": "guest"})
+# ------------------------------
+# Session Init
+# ------------------------------
+def _init_state():
+    ss = st.session_state
+    ss.setdefault("liked", set())
+    ss.setdefault("bag", set())
+    ss.setdefault("surprise", False)
+    ss.setdefault("search", "")
+    ss.setdefault("pool", [])         # unified item pool
+    ss.setdefault("byid", {})         # id-> item
+    ss.setdefault("last_rebuilt_at", 0.0)
 
-# -------------------------
-# Spotify Client Credentials
-# -------------------------
-@st.cache_data(ttl=3200, show_spinner=False)
-def spotify_token() -> str:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+_init_state()
+
+# ------------------------------
+# Utilities
+# ------------------------------
+def uid(domain: str, raw_id: Any) -> str:
+    return f"{domain}:{raw_id}"
+
+def human(s: str, limit=70) -> str:
+    return (s[:limit] + "…") if len(s) > limit else s
+
+def novelty_score(item_tags: List[str], liked_tags: List[str]) -> float:
+    """1.0 = very novel, 0.0 = same as likes (simple Jaccard complement)."""
+    if not item_tags:
+        return 0.6
+    A, B = set(item_tags), set(liked_tags)
+    if not A and not B:
+        return 0.6
+    inter = len(A & B)
+    union = len(A | B) or 1
+    sim = inter / union
+    return float(max(0.0, 1.0 - sim))
+
+def ensure_rerun():
+    # Aggressive updates like Netflix UI:
+    st.rerun()
+
+# ------------------------------
+# Data Sources
+# ------------------------------
+def fetch_tmdb_movies() -> List[Dict[str, Any]]:
+    # If key missing, return small curated demo
+    if not TMDB_KEY:
+        demo = [
+            dict(id=101, domain="movie", title="Black Phone 2", subtitle="Movies • Film",
+                 image="https://image.tmdb.org/t/p/w500/8fLC4n7LxQ5Zp7p8DDRD9YfL6bE.jpg",
+                 url="https://www.themoviedb.org/",
+                 tags=["horror","thriller","kidnap"]),
+            dict(id=102, domain="movie", title="Frankenstein", subtitle="Movies • Film",
+                 image="https://image.tmdb.org/t/p/w500/1SgK3Zf8dSV2mVqf0K0ePpI6LwQ.jpg",
+                 url="https://www.themoviedb.org/",
+                 tags=["classic","monster","gothic"]),
+        ]
+        return demo
+
+    try:
+        url = f"https://api.themoviedb.org/3/movie/popular?language=en-US&page=1"
+        r = requests.get(url, headers={"Authorization": f"Bearer {TMDB_KEY}"}, timeout=12)
+        r.raise_for_status()
+        results = r.json().get("results", [])[:20]
+        out = []
+        for m in results:
+            out.append(dict(
+                id=m["id"],
+                domain="movie",
+                title=m.get("title") or m.get("name") or "Untitled",
+                subtitle="Movies • Film",
+                image=(f"https://image.tmdb.org/t/p/w500{m.get('poster_path')}"
+                       if m.get("poster_path") else ""),
+                url=f"https://www.themoviedb.org/movie/{m.get('id')}",
+                tags=[g.lower() for g in ["movie","popular"]]
+            ))
+        return out
+    except Exception:
+        return []
+
+def _spotify_token() -> str:
+    if not (SPOTIFY_ID and SPOTIFY_SECRET):
         return ""
-    url = "https://accounts.spotify.com/api/token"
-    resp = requests.post(
-        url,
-        data={"grant_type": "client_credentials"},
-        auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-        timeout=15,
-    )
-    if resp.status_code == 200:
-        return resp.json().get("access_token", "")
-    return ""
-
-# -------------------------
-# TMDB helpers
-# -------------------------
-TMDB_IMG = "https://image.tmdb.org/t/p/w500"
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def tmdb_popular() -> List[dict]:
-    if not TMDB_API_KEY:
-        return []
-    url = f"https://api.themoviedb.org/3/trending/movie/week?api_key={TMDB_API_KEY}"
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type":"client_credentials"},
+            auth=(SPOTIFY_ID, SPOTIFY_SECRET),
+            timeout=12
+        )
         r.raise_for_status()
-        return r.json().get("results", [])
+        return r.json().get("access_token","")
     except Exception:
-        return []
+        return ""
 
-@st.cache_data(ttl=1200, show_spinner=False)
-def tmdb_search(q: str) -> List[dict]:
-    if not TMDB_API_KEY or not q.strip():
-        return []
-    url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={requests.utils.quote(q)}"
+def fetch_spotify_tracks() -> List[Dict[str, Any]]:
+    token = _spotify_token()
+    if not token:
+        # fallback demo
+        return [
+            dict(id="sp1", domain="music", title="Blue Eyes", subtitle="Music • Track",
+                 image="https://i.scdn.co/image/ab67616d0000b273d3c2f0e0ad57f9a7f5e3fabc",
+                 url="https://open.spotify.com/",
+                 tags=["pop","romance"]),
+            dict(id="sp2", domain="music", title="Life is Beautiful", subtitle="Music • Track",
+                 image="https://i.scdn.co/image/ab67616d0000b2731b1b4b6a83f3f9d9db1c02e1",
+                 url="https://open.spotify.com/",
+                 tags=["feelgood","indie"]),
+        ]
     try:
-        r = requests.get(url, timeout=15)
+        # Simple: get a popular editorial playlist's first tracks (Global Top 50)
+        r = requests.get(
+            "https://api.spotify.com/v1/playlists/37i9dQZEVXbMDoHDwVN2tF/tracks?limit=20",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=12
+        )
         r.raise_for_status()
-        return r.json().get("results", [])
+        items = r.json().get("items", [])
+        out = []
+        for it in items:
+            tr = it.get("track") or {}
+            out.append(dict(
+                id=tr.get("id") or f"t{random.randint(1,1e9)}",
+                domain="music",
+                title=tr.get("name","Track"),
+                subtitle="Music • Track",
+                image=(tr.get("album",{}).get("images",[{"url":""}])[0]["url"] or ""),
+                url=tr.get("external_urls",{}).get("spotify","https://open.spotify.com"),
+                tags=[a.get("name","") for a in tr.get("artists",[])]
+            ))
+        return out
     except Exception:
         return []
 
-# -------------------------
-# Spotify helpers
-# -------------------------
-@st.cache_data(ttl=1200, show_spinner=False)
-def spotify_search_tracks(q: str) -> List[dict]:
-    tok = spotify_token()
-    if not tok or not q.strip():
-        return []
-    url = f"https://api.spotify.com/v1/search?type=track&limit=20&q={requests.utils.quote(q)}"
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=15)
-        r.raise_for_status()
-        items = r.json().get("tracks", {}).get("items", [])
-        return items
-    except Exception:
-        return []
+def fetch_products_mock() -> List[Dict[str, Any]]:
+    # Replace later with Walmart/Flipkart once credentials are approved.
+    # Keep small catalog for demo.
+    cats = [
+        dict(id=f"p{n}", domain="product",
+             title=random.choice(["NoiseFit Nova","Boat Airdopes 141","Redmi Note Case",
+                                  "Puma Running Shoes","Dell Backpack 15"]),
+             subtitle="Products • E-commerce",
+             image=random.choice([
+                 "https://images.unsplash.com/photo-1519741497674-611481863552?q=80&w=600&auto=format&fit=crop",
+                 "https://images.unsplash.com/photo-1516726817505-f5ed825624d8?q=80&w=600&auto=format&fit=crop",
+                 "https://images.unsplash.com/photo-1512496015851-a90fb38ba796?q=80&w=600&auto=format&fit=crop",
+             ]),
+             url="https://www.flipkart.com/",
+             tags=random.choice([["electronics","audio"],["mobile","case"],["shoes","running"],["bag","laptop"]]))
+        for n in range(1, 18)
+    ]
+    return cats
 
-@st.cache_data(ttl=1200, show_spinner=False)
-def spotify_popular_seed() -> List[dict]:
-    """Use a fixed popular-ish seed query to populate a first row."""
-    tok = spotify_token()
-    if not tok:
-        return []
-    url = "https://api.spotify.com/v1/search?type=track&limit=20&q=top%20hits"
-    try:
-        r = requests.get(url, headers={"Authorization": f"Bearer {tok}"}, timeout=15)
-        r.raise_for_status()
-        return r.json().get("tracks", {}).get("items", [])
-    except Exception:
-        return []
+# ------------------------------
+# Build Unified Pool
+# ------------------------------
+@st.cache_data(show_spinner=False, ttl=900)
+def build_pool() -> List[Dict[str, Any]]:
+    movies  = fetch_tmdb_movies()
+    music   = fetch_spotify_tracks()
+    prods   = fetch_products_mock()
+    pool = movies + music + prods
 
-# -------------------------
-# Product mock + future hooks
-# -------------------------
-MOCK_PRODUCTS = [
-    {
-        "id": f"prod-{i}",
-        "title": t,
-        "brand": b,
-        "img": img,
-        "category": c,
-        "price": p,
-        "url": u
-    }
-    for i, (t, b, img, c, p, u) in enumerate([
-        ("Wireless Over-Ear Headphones", "Novaclear", "https://images.unsplash.com/photo-1518449180961-6d4a67759e1a?q=80&w=800", "Electronics", 69.0, "https://example.com/p1"),
-        ("Lightweight Running Shoes", "RoadRun", "https://images.unsplash.com/photo-1542291026-7eec264c27ff?q=80&w=800", "Footwear", 49.0, "https://example.com/p2"),
-        ("Stainless Water Bottle 1L", "HydroPro", "https://images.unsplash.com/photo-1514432324607-a09d9b4aefdd?q=80&w=800", "Outdoors", 19.0, "https://example.com/p3"),
-        ("Cotton Graphic Tee", "UrbanInk", "https://images.unsplash.com/photo-1520975682031-137cc8f6f0a5?q=80&w=800", "Apparel", 15.0, "https://example.com/p4"),
-        ("Smart Fitness Band", "FitLoop", "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?q=80&w=800", "Wearables", 39.0, "https://example.com/p5"),
-    ])
-]
+    # Give every item a tags list and novelty default
+    for it in pool:
+        it.setdefault("tags", [])
+        it["novelty"] = 0.7  # baseline; recomputed per-user below
+    return pool
 
-@st.cache_data(ttl=900, show_spinner=False)
-def product_search(q: str) -> List[dict]:
-    """Future: swap this with Walmart/Amazon search.
-       For now: fuzzy contains on mock catalog."""
-    if not q.strip():
-        return MOCK_PRODUCTS
-    ql = q.lower()
-    out = []
-    for p in MOCK_PRODUCTS:
-        blob = " ".join([p["title"], p["brand"], p["category"]]).lower()
-        if ql in blob:
-            out.append(p)
-    return out
+def index_pool(pool: List[Dict[str,Any]]) -> Dict[str, Dict[str,Any]]:
+    return { uid(it["domain"], it["id"]) : it for it in pool }
 
-# -------------------------
-# Unify into a single catalog
-# -------------------------
-def normalize_movie(m: dict) -> dict:
-    mid = f"movie-{m.get('id')}"
-    img = m.get("poster_path")
-    return {
-        "id": mid,
-        "kind": "movie",
-        "title": m.get("title") or m.get("name") or "Untitled",
-        "subtitle": "Movies • Film",
-        "img": TMDB_IMG + img if img else "https://images.unsplash.com/photo-1497032628192-86f99bcd76bc?w=800",
-        "tags": [g for g in [m.get("original_language"), "movie"] if g],
-        "score": m.get("vote_average", 0),
-        "meta": f"{m.get('release_date', '')[:4] or ''}",
-        "url": f"https://www.themoviedb.org/movie/{m.get('id')}",
-    }
+# ------------------------------
+# Recommender (lightweight, fast)
+# ------------------------------
+def liked_tags(byid: Dict[str,Any], liked_ids: List[str]) -> List[str]:
+    tags = []
+    for k in liked_ids:
+        it = byid.get(k)
+        if it: tags += it.get("tags", [])
+    return [t for t in pd.Series(tags).value_counts().index.tolist()]
 
-def normalize_track(t: dict) -> dict:
-    tid_raw = t.get("id", "")
-    tid = f"track-{tid_raw}"
-    img = ""
-    try:
-        album_imgs = t.get("album", {}).get("images", [])
-        if album_imgs:
-            img = album_imgs[0]["url"]
-    except Exception:
-        pass
-    artists = ", ".join([a["name"] for a in t.get("artists", [])]) or "Artist"
-    return {
-        "id": tid,
-        "kind": "music",
-        "title": t.get("name") or "Untitled",
-        "subtitle": artists,
-        "img": img or "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800",
-        "tags": [a["name"] for a in t.get("artists", [])][:3] + ["track"],
-        "score": t.get("popularity", 0),
-        "meta": "Music • Track",
-        "url": t.get("external_urls", {}).get("spotify", "https://open.spotify.com/"),
-    }
+def score_item(it: Dict[str,Any], liked_tag_list: List[str], surprise: bool) -> float:
+    n = novelty_score(it.get("tags", []), liked_tag_list)
+    base = 0.5
+    # If user liked similar tags, boost (unless surprise mode)
+    overlap = len(set(it.get("tags", [])) & set(liked_tag_list))
+    sim_boost = 0.15 * overlap
+    if surprise:
+        return base + n * 0.7 - sim_boost * 0.3
+    return base + sim_boost * 0.5 + n * 0.25
 
-def normalize_product(p: dict) -> dict:
-    return {
-        "id": p["id"],
-        "kind": "product",
-        "title": p["title"],
-        "subtitle": p["brand"],
-        "img": p["img"],
-        "tags": [p["category"], "product"],
-        "score": p["price"],
-        "meta": f"₹{int(round(float(p['price'])))}",
-        "url": p["url"],
-    }
+def recommend(pool, byid, liked_ids, k=20, surprise=False):
+    lt = liked_tags(byid, list(liked_ids))
+    candidates = []
+    for it in pool:
+        iid = uid(it["domain"], it["id"])
+        if iid in liked_ids:
+            continue
+        candidates.append((score_item(it, lt, surprise), it))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in candidates[:k]]
 
-def novelty_score(item_tags: List[str], liked_tag_pool: List[str]) -> float:
-    """Quanta-style lightweight novelty = 1 - (overlap / union) based on tags."""
-    a = set(t.lower() for t in item_tags)
-    b = set(t.lower() for t in liked_tag_pool)
-    if not a:
-        return 0.5
-    union = len(a.union(b)) or 1
-    overlap = len(a.intersection(b))
-    return max(0.0, min(1.0, 1.0 - (overlap / union)))
-
-def gather_liked_tag_pool(catalog: List[dict]) -> List[str]:
-    liked = [x for x in catalog if x["id"] in st.session_state.liked_ids]
-    pool = []
-    for x in liked:
-        pool.extend(x.get("tags", []))
-    return pool[:100]
-
-# -------------------------
-# Build the homepage rows
-# -------------------------
-def fetch_catalog(search_q: str = "") -> Dict[str, List[dict]]:
-    # Movies
-    movies = tmdb_search(search_q) if search_q else tmdb_popular()
-    movies_norm = [normalize_movie(m) for m in (movies or [])][:20]
-
-    # Music
-    tracks = spotify_search_tracks(search_q) if search_q else spotify_popular_seed()
-    tracks_norm = [normalize_track(t) for t in (tracks or [])][:20]
-
-    # Products (mock or future API)
-    prods = product_search(search_q)
-    prods_norm = [normalize_product(p) for p in prods][:20]
-
-    return {"movies": movies_norm, "music": tracks_norm, "products": prods_norm}
-
-# -------------------------
-# UI pieces
-# -------------------------
-def like_bag_row(item: dict):
-    left, right = st.columns([1, 1])
-    liked = item["id"] in st.session_state.liked_ids
-    in_bag = item["id"] in st.session_state.bag_ids
-
-    if left.button(("❤️" if liked else "♡  Like"), key=f"like_{item['id']}"):
-        if liked:
-            st.session_state.liked_ids.remove(item["id"])
-        else:
-            st.session_state.liked_ids.add(item["id"])
-        st.rerun()
-
-    if right.button(("🛍️ In Bag" if in_bag else "＋  Bag"), key=f"bag_{item['id']}"):
-        if in_bag:
-            st.session_state.bag_ids.remove(item["id"])
-        else:
-            st.session_state.bag_ids.add(item["id"])
-        st.rerun()
-
-def render_card(item: dict, liked_pool: List[str]):
-    with st.container():
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.image(item["img"], use_container_width=True)
-        st.markdown(f"<div style='padding:10px 12px'>"
-                    f"<div style='font-weight:700'>{item['title']}</div>"
-                    f"<div class='meta'>{item['subtitle']}</div>", unsafe_allow_html=True)
-        # Novelty
-        nov = novelty_score(item.get("tags", []), liked_pool)
-        st.markdown(f"""
-            <div style='padding:0 12px 8px 12px'>
-              <div class='pill'>🧭 Novelty {int(nov*100)}%</div>
-              <div style='height:10px'></div>
-              <div class='nov-wrap'><div class='nov-fill' style='width:{int(nov*100)}%'></div></div>
-            </div>
-        """, unsafe_allow_html=True)
-        with st.container():
-            like_bag_row(item)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-def render_row(title: str, items: List[dict], liked_pool: List[str]):
-    if not items:
-        return
-    st.markdown(f"<div class='row-title'>{title}</div>", unsafe_allow_html=True)
-    # 5 cards per row
-    chunks = [items[i:i+5] for i in range(0, len(items), 5)]
-    for row in chunks:
-        cols = st.columns(5, gap="large")
-        for c, it in zip(cols, row):
-            with c:
-                render_card(it, liked_pool)
-
-def sidebar():
+# ------------------------------
+# UI: Controls
+# ------------------------------
+def sidebar_controls():
     with st.sidebar:
         st.markdown("## ReccoVerse")
-        st.button("Sign Out", key="signout")
-        st.markdown("#### ")
-        st.text_input("Search anything…", key="search", placeholder="movies, artists, shoes…", label_visibility="visible")
-        st.checkbox("📈 Surprise Mode (shuffle)", key="surprise")
+        st.button("Sign Out", use_container_width=True, type="secondary", key="signout_btn")
 
-        # Likes & Bag quick peek
-        if st.session_state.liked_ids:
-            st.markdown("### ❤️ Liked")
-            st.caption(f"{len(st.session_state.liked_ids)} items")
-        if st.session_state.bag_ids:
-            st.markdown("### 🛍️ Bag")
-            st.caption(f"{len(st.session_state.bag_ids)} items")
+        st.markdown("#### Search anything…")
+        q = st.text_input("", key="search", placeholder="movie, artist, shoes…", label_visibility="collapsed")
+        st.checkbox("Surprise Mode (shuffle)", key="surprise")
+        st.markdown('<div class="small">Tip: Try queries like <b>romance</b>, <b>phone</b>, <b>Taylor</b>.</div>', unsafe_allow_html=True)
 
-def top_header():
-    st.markdown(f"<div class='title-hero'>🍿 Top Picks For You</div>", unsafe_allow_html=True)
+# ------------------------------
+# UI Helpers
+# ------------------------------
+def novelty_bar(n: float):
+    n = max(0.0, min(1.0, n))
+    st.markdown(
+        f"""
+        <div class="metricbar"><div style="width:{int(n*100)}%"></div></div>
+        <div class="small">Novelty {int(n*100)}%</div>
+        """, unsafe_allow_html=True
+    )
 
-def page_likes_bag(catalog_all: List[dict]):
-    st.markdown("## ❤️ Your Liked")
-    liked = [x for x in catalog_all if x["id"] in st.session_state.liked_ids]
-    pool = gather_liked_tag_pool(catalog_all)
-    render_row("Liked Items", liked, pool)
+def like_bag_row(item: Dict[str,Any]):
+    iid = uid(item["domain"], item["id"])
+    left, right = st.columns([1,1], vertical_alignment="center")
 
-    st.markdown("## 🛍️ Your Bag")
-    bag = [x for x in catalog_all if x["id"] in st.session_state.bag_ids]
-    render_row("Bag Items", bag, pool)
+    liked = iid in st.session_state.liked
+    bagged = iid in st.session_state.bag
 
-# -------------------------
-# MAIN
-# -------------------------
+    if left.button(("❤️" if liked else "♡  Like"), key=f"like_{iid}"):
+        if liked:
+            st.session_state.liked.remove(iid)
+        else:
+            st.session_state.liked.add(iid)
+        ensure_rerun()
+
+    if right.button(("👜  In Bag" if bagged else "＋  Bag"), key=f"bag_{iid}"):
+        if bagged:
+            st.session_state.bag.remove(iid)
+        else:
+            st.session_state.bag.add(iid)
+        ensure_rerun()
+
+def card(item: Dict[str,Any]):
+    # Image + text
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        img = item.get("image") or "https://via.placeholder.com/600x800?text=No+Image"
+        st.image(img, use_container_width=True, clamp=True)
+        st.markdown(f"**{human(item['title'], 60)}**")
+        st.markdown(f"<div class='small'>{item.get('subtitle','')}</div>", unsafe_allow_html=True)
+        novelty_bar(item.get("novelty", 0.6))
+        like_bag_row(item)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+def render_row(title: str, items: List[Dict[str,Any]], anchor: str):
+    st.markdown(f"""<div class="rowtitle"><span class="emoji">🍿</span><h3>{title}</h3></div>""", unsafe_allow_html=True)
+    if not items:
+        st.info("No items found for this section.")
+        return
+
+    # Grid 5 per row
+    per_row = 5
+    for i in range(0, len(items), per_row):
+        cols = st.columns(per_row)
+        chunk = items[i:i+per_row]
+        for c, it in zip(cols, chunk):
+            with c:
+                card(it)
+
+# ------------------------------
+# Search / Filter
+# ------------------------------
+def filter_items(pool: List[Dict[str,Any]], q:str) -> List[Dict[str,Any]]:
+    q = (q or "").strip().lower()
+    if not q:
+        return pool
+    out = []
+    for it in pool:
+        hay = " ".join([
+            it.get("title",""), it.get("subtitle",""),
+            " ".join(it.get("tags",[]))
+        ]).lower()
+        if q in hay:
+            out.append(it)
+    return out
+
+# ------------------------------
+# Pages
+# ------------------------------
+def page_home(all_items: List[Dict[str,Any]], byid: Dict[str,Any]):
+    # Compute novelty per item for display relative to user's current likes
+    lt = liked_tags(byid, list(st.session_state.liked))
+    for it in all_items:
+        it["novelty"] = novelty_score(it.get("tags",[]), lt)
+
+    # Search filter
+    items = filter_items(all_items, st.session_state.search)
+
+    # Popular rows by domain
+    movies  = [it for it in items if it["domain"]=="movie"][:15]
+    music   = [it for it in items if it["domain"]=="music"][:15]
+    prods   = [it for it in items if it["domain"]=="product"][:15]
+
+    recs = recommend(items, byid, st.session_state.liked, k=20, surprise=st.session_state.surprise)
+
+    st.markdown("## 🍿 Top Picks For You")
+    if movies: render_row("Popular Movies", movies, "m")
+    if music:  render_row("Top Music Tracks", music, "mu")
+    if prods:  render_row("Trending Products", prods, "p")
+
+    # Personalized
+    if st.session_state.liked:
+        render_row("Because You Liked These", recs, "rec")
+
+def page_likes_bag(all_items: List[Dict[str,Any]], byid: Dict[str,Any]):
+    liked   = [byid[i] for i in st.session_state.liked if i in byid]
+    bagged  = [byid[i] for i in st.session_state.bag if i in byid]
+
+    st.markdown("## ❤️ Liked & 👜 Bag")
+    render_row("Liked Items", liked, "liked")
+    render_row("In Your Bag", bagged, "bag")
+
+# ------------------------------
+# App
+# ------------------------------
 def main():
-    sidebar()
-    st.markdown(f"<h1 style='margin-top:-10px'>{APP_TITLE}</h1>", unsafe_allow_html=True)
-    top_header()
+    sidebar_controls()
 
-    q = st.session_state.search.strip()
-    cat = fetch_catalog(q)
+    # (Re)build pool when empty or every 15 minutes
+    now = time.time()
+    if (now - st.session_state.last_rebuilt_at) > 900 or not st.session_state.pool:
+        pool = build_pool()
+        st.session_state.pool = pool
+        st.session_state.byid = index_pool(pool)
+        st.session_state.last_rebuilt_at = now
 
-    # Surprise mode randomize
-    if st.session_state.surprise:
-        random.seed(42)
-        for k in cat:
-            random.shuffle(cat[k])
+    pool = st.session_state.pool
+    byid = st.session_state.byid
 
-    # Build a single list for liked-pool computation
-    all_items = cat["movies"] + cat["music"] + cat["products"]
-    liked_pool = gather_liked_tag_pool(all_items)
-
-    # Rows
-    render_row("🎬 Popular Movies", cat["movies"], liked_pool)
-    render_row("🎵 Top Music Tracks", cat["music"], liked_pool)
-    render_row("🛍️ Trending Products", cat["products"], liked_pool)
-
-    # Because you liked
-    if st.session_state.liked_ids:
-        # simple filter: different kind than what you liked + higher novelty
-        liked_kinds = {x["kind"] for x in all_items if x["id"] in st.session_state.liked_ids}
-        recs = [x for x in all_items if x["kind"] not in liked_kinds]
-        recs.sort(key=lambda r: novelty_score(r.get("tags", []), liked_pool), reverse=True)
-        render_row("💖 Because You Liked These", recs[:10], liked_pool)
-
-    st.markdown("---")
-    if st.button("Open Liked & Bag", key="open_lb"):
-        st.session_state["__lb"] = True
-        st.rerun()
-
-    if st.session_state.get("__lb"):
-        page_likes_bag(all_items)
-        if st.button("Close", key="close_lb"):
-            st.session_state["__lb"] = False
-            st.rerun()
+    # Nav (Netflix keeps it single page; we show two tabs)
+    tabs = st.tabs(["🏠 Home", "❤️ Liked & 👜 Bag"])
+    with tabs[0]:
+        page_home(pool, byid)
+    with tabs[1]:
+        page_likes_bag(pool, byid)
 
 if __name__ == "__main__":
     main()
