@@ -1,7 +1,3 @@
-# =========================================================
-#  ReccoVerse v3 — Cinematic Multidomain AI Recommender
-#  Author: Pavan Kumar Reddy Pothireddy & GPT-5
-# =========================================================
 import streamlit as st
 import pandas as pd, numpy as np, requests, uuid, random
 from datetime import datetime
@@ -186,3 +182,16 @@ def main_app():
 if "authed" not in st.session_state: st.session_state.authed=False
 if not st.session_state.authed: login_screen()
 else: main_app()
+# ---------------------------------------------------------
+# ENTRYPOINT (safe session init)
+if "authed" not in st.session_state:
+    st.session_state["authed"] = False
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+
+# Safe check before using
+if not st.session_state["authed"]:
+    login_screen()
+else:
+    main_app()
+
