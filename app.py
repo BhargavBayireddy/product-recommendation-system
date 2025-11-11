@@ -1,12 +1,6 @@
-# app.py — ReccoVerse (cinematic AI-powered hybrid recommender)
-# Version: Multi-domain online dataset (Movies + Music + Beauty)
-# Run locally: streamlit run app.py
-
-import os, io, json, time, zipfile, gzip, hashlib, random, requests
+import os, io, json, time, zipfile, gzip, hashlib, random, base64, requests
 from pathlib import Path
-from datetime import datetime
 from typing import Dict, Any, List, Tuple
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,6 +13,9 @@ from firebase_init import (
     fetch_user_interactions,
     fetch_global_interactions,
     ensure_user,
+    email_exists,
+    send_phone_otp,
+    verify_phone_otp,
     FIREBASE_READY,
 )
 
@@ -30,7 +27,6 @@ from gnn_infer import (
     cold_start_mmr,
 )
 
-# ---------- App Config ----------
 APP_NAME = "ReccoVerse"
 ART = Path("artifacts")
 REFRESH_MS = 5000
@@ -38,28 +34,30 @@ CARD_COLS = 5
 
 st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
 
-# ---------- Inject CSS ----------
+# ------------------ CSS ------------------
 def inject_css():
     css_path = Path("ui.css")
     if css_path.exists():
         st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
-    else:
-        st.markdown(
-            """
-            <style>
-            body{background:#0b0e14;color:#e7e7ea;}
-            .recco-title{font-size:2.4rem;font-weight:900;letter-spacing:.02em;margin:1rem 0;}
-            .card{border-radius:14px;overflow:hidden;border:1px solid #1f2633;margin-bottom:10px;transition:all .2s ease;}
-            .card:hover{transform:scale(1.02);box-shadow:0 0 25px rgba(73,187,255,.1);}
-            .section-title{font-size:1.3rem;font-weight:800;margin-top:1rem;}
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
+    # hero/video styles
+    st.markdown("""
+    <style>
+    .hero-wrap { position:relative; height:48vh; min-height:380px; border-radius:28px; overflow:hidden; border:1px solid #1e2738; }
+    .hero-video { position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; filter:contrast(1.08) saturate(1.05) brightness(.82); }
+    .hero-overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column;
+        background: radial-gradient(900px 420px at 20% 10%, rgba(73,187,255,.10), transparent 60%),
+                    radial-gradient(900px 420px at 80% 10%, rgba(255,73,146,.08), transparent 60%); }
+    .brand { font-size:3.1rem; font-weight:900; letter-spacing:.02em; text-shadow:0 0 18px rgba(73,187,255,.28); }
+    .tagline { opacity:.88; margin-top:.35rem; }
+    .login-card { background:rgba(12,18,33,.55); border:1px solid #1f2a3a; border-radius:18px; padding:18px; backdrop-filter: blur(6px); }
+    .option-btn { width:100%; padding:.8rem 1rem; border-radius:999px; border:1px solid #24324a; background:#0f1626; color:#e7e7ea; font-weight:700; }
+    .option-btn:hover { background:#111b2e; }
+    </style>
+    """, unsafe_allow_html=True)
 
 inject_css()
 
-# ---------- Session State ----------
+# ------------------ Session ------------------
 def init_state():
     ss = st.session_state
     ss.setdefault("authed", False)
@@ -70,18 +68,22 @@ def init_state():
     ss.setdefault("id_to_idx", None)
     ss.setdefault("liked", set())
     ss.setdefault("bag", set())
+    ss.setdefault("auth_mode", "email")    # 'email' or 'phone'
+    ss.setdefault("otp_sent", False)
+    ss.setdefault("otp_phone", "")
+    ss.setdefault("otp_hint", "")          # dev mode: show OTP when Twilio not set
 
 init_state()
 
-# ---------- Multi-Domain Online Loader ----------
-@st.cache_data(show_spinner="Fetching multi-domain datasets (Movies, Music, Beauty)...")
+# ------------------ Online Multi-domain Loader ------------------
+@st.cache_data(show_spinner="Fetching Movies + Music + Beauty…")
 def load_multidomain_online():
     frames = []
 
-    # 🎬 MOVIES — MovieLens
+    # Movies (MovieLens)
     try:
         mov_url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
-        with zipfile.ZipFile(io.BytesIO(requests.get(mov_url, timeout=10).content)) as z:
+        with zipfile.ZipFile(io.BytesIO(requests.get(mov_url, timeout=12).content)) as z:
             with z.open("ml-latest-small/movies.csv") as f:
                 movies = pd.read_csv(f)
         frames.append(pd.DataFrame({
@@ -93,9 +95,9 @@ def load_multidomain_online():
             "text": movies["title"] + " " + movies["genres"]
         }).sample(200))
     except Exception as e:
-        st.warning(f"Movies dataset load failed: {e}")
+        st.warning(f"Movies load failed: {e}")
 
-    # 🎧 MUSIC — Last.fm open sample
+    # Music (Last.fm tiny sample)
     try:
         mus_url = "https://raw.githubusercontent.com/yg397/music-recommender-dataset/master/data.csv"
         music = pd.read_csv(mus_url).dropna().sample(200)
@@ -108,12 +110,12 @@ def load_multidomain_online():
             "text": music["artist"] + " " + music["track"]
         }))
     except Exception as e:
-        st.warning(f"Music dataset load failed: {e}")
+        st.warning(f"Music load failed: {e}")
 
-    # 💄 BEAUTY PRODUCTS — Amazon subset
+    # Beauty (Amazon subset mirror)
     try:
         beauty_url = "https://datarepo.s3.amazonaws.com/beauty_5.json.gz"
-        with gzip.open(io.BytesIO(requests.get(beauty_url, timeout=10).content)) as f:
+        with gzip.open(io.BytesIO(requests.get(beauty_url, timeout=12).content)) as f:
             lines = [json.loads(l) for l in f.readlines()[:2000]]
         beauty = pd.DataFrame(lines)
         frames.append(pd.DataFrame({
@@ -125,77 +127,146 @@ def load_multidomain_online():
             "text": beauty["title"] + " " + beauty.get("description", "").astype(str)
         }).dropna().sample(200))
     except Exception as e:
-        st.warning(f"Beauty dataset load failed: {e}")
+        st.warning(f"Beauty load failed: {e}")
 
     all_df = pd.concat(frames, ignore_index=True)
     all_df.drop_duplicates(subset=["title"], inplace=True)
-    st.success(f"Fetched {len(all_df)} items across {len(frames)} domains.")
     return all_df
 
-# ---------- Auth UI ----------
-def splash_login():
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="hero-inner">
-                <div class="brand-glow">ReccoVerse</div>
-                <div class="tagline">AI-curated picks across Movies • Music • Products</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.subheader("Sign In / Sign Up")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        with st.form("login"):
-            email = st.text_input("Email", key="login_email")
-            pwd = st.text_input("Password", type="password", key="login_pwd")
-            submitted = st.form_submit_button("Sign In")
-        if submitted:
-            ok, uid_or_msg = login_email_password(email, pwd)
-            if ok:
-                st.session_state.authed = True
-                st.session_state.uid = uid_or_msg
-                st.session_state.email = email
-                ensure_user(uid_or_msg, email)
-                st.success("Welcome back!")
-                st.experimental_rerun()
-            else:
-                st.error(uid_or_msg)
-    with col2:
-        with st.form("signup"):
-            email_up = st.text_input("New Email", key="signup_email")
-            pwd_up = st.text_input("New Password", type="password", key="signup_pwd")
-            submitted_up = st.form_submit_button("Create Account")
-        if submitted_up:
-            ok, uid_or_msg = signup_email_password(email_up, pwd_up)
-            if ok:
-                st.success("Account created! Please sign in.")
-            else:
-                st.error(uid_or_msg)
-
-    st.caption(("Using " + ("Firebase" if FIREBASE_READY else "local mock")) + " backend.")
-
-# ---------- Helper Buttons ----------
-def toggle_like(uid, item_id, action):
-    if action == "like":
-        st.session_state.liked.add(item_id)
-        add_interaction(uid, item_id, "like")
+# ------------------ Hero (AI video background) ------------------
+def hero_with_video():
+    # Use a local video if available at artifacts/hero.mp4 else remote fallback.
+    local_video = ART / "hero.mp4"
+    if local_video.exists():
+        b64 = base64.b64encode(local_video.read_bytes()).decode("utf-8")
+        src = f"data:video/mp4;base64,{b64}"
     else:
-        st.session_state.liked.discard(item_id)
-        add_interaction(uid, item_id, "unlike")
+        # Fallback public AI/tech motion video
+        src = "https://assets.mixkit.co/videos/preview/mixkit-artificial-intelligence-visualization-984-large.mp4"
 
-def toggle_bag(uid, item_id, action):
-    if action == "bag":
-        st.session_state.bag.add(item_id)
-        add_interaction(uid, item_id, "bag")
-    else:
-        st.session_state.bag.discard(item_id)
-        add_interaction(uid, item_id, "remove_bag")
+    st.markdown(f"""
+    <div class="hero-wrap">
+      <video class="hero-video" autoplay muted loop playsinline>
+        <source src="{src}" type="video/mp4">
+      </video>
+      <div class="hero-overlay">
+        <div class="brand">ReccoVerse</div>
+        <div class="tagline">AI-curated picks across Movies • Music • Products</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-def render_item_card(row, liked, bagged, uid):
+# ------------------ Auth UI (single page) ------------------
+def auth_page():
+    hero_with_video()
+    st.write("")
+    left, right = st.columns([1,1])
+
+    # Mode switcher
+    with left:
+        st.markdown("#### Join with")
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("📧 Email", use_container_width=True):
+                st.session_state.auth_mode = "email"
+        with colB:
+            if st.button("📱 Mobile (OTP)", use_container_width=True):
+                st.session_state.auth_mode = "phone"
+        st.caption(f"Backend: {'Firebase' if FIREBASE_READY else 'Local mock'}")
+
+    with right:
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+
+        if st.session_state.auth_mode == "email":
+            st.markdown("##### Continue with Email")
+            email = st.text_input("Email", key="email_login")
+            pwd = st.text_input("Password", type="password", key="pwd_login")
+
+            c1, c2 = st.columns([1,1])
+            with c1:
+                if st.button("Continue", use_container_width=True):
+                    if not email or not pwd:
+                        st.error("Enter email and password.")
+                    else:
+                        if email_exists(email):
+                            ok, uid_or_msg = login_email_password(email, pwd)
+                            if ok:
+                                st.session_state.authed = True
+                                st.session_state.uid = uid_or_msg
+                                st.session_state.email = email
+                                ensure_user(uid_or_msg, email=email)
+                                st.success("Logged in!")
+                                st.experimental_rerun()
+                            else:
+                                # Distinguish wrong password vs other
+                                if "INVALID_PASSWORD" in uid_or_msg or "password" in uid_or_msg.lower():
+                                    st.error("Incorrect password. Try again.")
+                                else:
+                                    st.error("Login failed. Check credentials.")
+                        else:
+                            st.warning("Account does not exist. Click 'Create Account' to sign up.")
+            with c2:
+                if st.button("Create Account", use_container_width=True):
+                    if not email or not pwd:
+                        st.error("Enter email and password to sign up.")
+                    else:
+                        if email_exists(email):
+                            st.error("Email already registered. Use Continue to sign in.")
+                        else:
+                            ok, uid_or_msg = signup_email_password(email, pwd)
+                            if ok:
+                                st.session_state.authed = True
+                                st.session_state.uid = uid_or_msg
+                                st.session_state.email = email
+                                ensure_user(uid_or_msg, email=email)
+                                st.success("Account created and logged in.")
+                                st.experimental_rerun()
+                            else:
+                                st.error(uid_or_msg)
+
+        else:
+            st.markdown("##### Continue with Mobile (OTP)")
+            phone = st.text_input("Mobile number (E.164, e.g., +91xxxxxxxxxx)", key="phone_input")
+            col1, col2 = st.columns([1,1])
+            with col1:
+                if st.button("Send OTP", use_container_width=True):
+                    if not phone:
+                        st.error("Enter your mobile number.")
+                    else:
+                        ok, msg = send_phone_otp(phone)
+                        st.session_state.otp_sent = ok
+                        st.session_state.otp_phone = phone
+                        st.session_state.otp_hint = msg if msg.isdigit() else ""
+                        if ok:
+                            if msg.isdigit():
+                                st.info(f"(Dev) OTP: {msg}")
+                            else:
+                                st.success(msg)
+                        else:
+                            st.error(msg)
+            with col2:
+                otp = st.text_input("Enter OTP", key="otp_code")
+                if st.button("Verify & Continue", use_container_width=True):
+                    if not st.session_state.otp_sent:
+                        st.error("Send OTP first.")
+                    elif not otp:
+                        st.error("Enter the OTP.")
+                    else:
+                        ok, uid_or_msg = verify_phone_otp(st.session_state.otp_phone, otp)
+                        if ok:
+                            st.session_state.authed = True
+                            st.session_state.uid = uid_or_msg
+                            st.session_state.email = f"{st.session_state.otp_phone}@phone.local"
+                            ensure_user(uid_or_msg, phone=st.session_state.otp_phone)
+                            st.success("Logged in with mobile.")
+                            st.experimental_rerun()
+                        else:
+                            st.error(uid_or_msg)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# ------------------ Item Grid/UI ------------------
+def render_item_card(row: pd.Series, liked: bool, bagged: bool, uid: str):
     with st.container():
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.image(row["image"], use_column_width=True)
@@ -205,25 +276,38 @@ def render_item_card(row, liked, bagged, uid):
         c1, c2 = st.columns(2)
         with c1:
             if st.button(("❤️ Liked" if liked else "♡ Like"), key=f"like_{row.item_id}"):
-                toggle_like(uid, row.item_id, "unlike" if liked else "like")
+                if liked:
+                    add_interaction(uid, row.item_id, "unlike")
+                    st.session_state.liked.discard(row.item_id)
+                else:
+                    add_interaction(uid, row.item_id, "like")
+                    st.session_state.liked.add(row.item_id)
                 st.experimental_rerun()
         with c2:
-            if st.button(("👜 In Bag" if bagged else "➕ Add"), key=f"bag_{row.item_id}"):
-                toggle_bag(uid, row.item_id, "remove_bag" if bagged else "bag")
+            if st.button(("👜 In Bag" if bagged else "➕ Add to Bag"), key=f"bag_{row.item_id}"):
+                if bagged:
+                    add_interaction(uid, row.item_id, "remove_bag")
+                    st.session_state.bag.discard(row.item_id)
+                else:
+                    add_interaction(uid, row.item_id, "bag")
+                    st.session_state.bag.add(row.item_id)
                 st.experimental_rerun()
 
-def section_grid(title, items_df, ids, uid):
-    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+def section_grid(title: str, items_df: pd.DataFrame, ids: List[str], uid: str):
+    st.markdown(f"### {title}")
     if not ids:
-        st.info("No items yet.")
+        st.info("No items to show yet.")
         return
     cols = st.columns(CARD_COLS)
-    for i, iid in enumerate(ids[:CARD_COLS * 2]):
-        row = items_df[items_df.item_id == iid].iloc[0]
+    for i, iid in enumerate(ids[:CARD_COLS * 2 + 5]):
+        row = items_df[items_df.item_id == iid]
+        if row.empty: 
+            continue
+        row = row.iloc[0]
         with cols[i % CARD_COLS]:
             render_item_card(row, iid in st.session_state.liked, iid in st.session_state.bag, uid)
 
-# ---------- Main Pages ----------
+# ------------------ Data/Embeddings ------------------
 def ensure_embeddings_loaded():
     if st.session_state.items_df is None or st.session_state.embeddings is None:
         items_online = load_multidomain_online()
@@ -233,11 +317,12 @@ def ensure_embeddings_loaded():
         st.session_state.id_to_idx = id_to_idx
         st.session_state.A = A
 
-def page_home(uid):
-    st.markdown(f"<div class='recco-title'>{APP_NAME}</div>", unsafe_allow_html=True)
-    st.caption(f"Logged in as **{st.session_state.email}**")
-
+# ------------------ Pages ------------------
+def page_home(uid: str):
+    st.markdown(f"## {APP_NAME}")
+    st.caption(f"Signed in as **{st.session_state.email}** • Backend: {'Firebase' if FIREBASE_READY else 'Mock'}")
     ensure_embeddings_loaded()
+
     items_df = st.session_state.items_df
     embs = st.session_state.embeddings
     id2idx = st.session_state.id_to_idx
@@ -260,21 +345,22 @@ def page_home(uid):
     section_grid("Because You Liked Similar Items", items_df, because_similar, uid)
     section_grid("Explore Something Different", items_df, cold, uid)
 
-    st.autorefresh(interval=REFRESH_MS, key="auto_refresh_home")
+    st.autorefresh(interval=REFRESH_MS, key="home_refresh")
 
-def page_liked(uid):
-    st.markdown("<div class='recco-title'>Liked Items</div>", unsafe_allow_html=True)
+def page_liked(uid: str):
+    st.markdown("## Liked Items")
     ensure_embeddings_loaded()
     section_grid("Your ❤️ Likes", st.session_state.items_df, list(st.session_state.liked), uid)
 
-def page_bag(uid):
-    st.markdown("<div class='recco-title'>Your Bag</div>", unsafe_allow_html=True)
+def page_bag(uid: str):
+    st.markdown("## Your Bag")
     ensure_embeddings_loaded()
     section_grid("Saved for Later", st.session_state.items_df, list(st.session_state.bag), uid)
 
-def page_compare(uid):
-    st.markdown("<div class='recco-title'>Compare Engines</div>", unsafe_allow_html=True)
+def page_compare(uid: str):
+    st.markdown("## Compare Engines")
     ensure_embeddings_loaded()
+
     items_df = st.session_state.items_df
     embs = st.session_state.embeddings
     id2idx = st.session_state.id_to_idx
@@ -298,7 +384,7 @@ def page_compare(uid):
     fig.update_layout(barmode="group", height=420, margin=dict(l=20,r=20,t=20,b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-# ---------- Navbar ----------
+# ------------------ Navbar & Router ------------------
 def navbar():
     st.sidebar.markdown("### ReccoVerse")
     page = st.sidebar.radio("Navigation", ["Home", "Liked Items", "Bag", "Compare"])
@@ -308,10 +394,9 @@ def navbar():
         st.experimental_rerun()
     return page
 
-# ---------- Entrypoint ----------
 def main():
     if not st.session_state.authed:
-        splash_login()
+        auth_page()
         return
     page = navbar()
     uid = st.session_state.uid
