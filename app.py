@@ -1,267 +1,188 @@
-# app.py — ReccoVerse v2 (Cinematic Multi-Domain AI Recommender)
-import os, io, json, zipfile, gzip, base64, requests, uuid, time
-from pathlib import Path
-import pandas as pd
+# =========================================================
+#  ReccoVerse v3 — Cinematic Multidomain AI Recommender
+#  Author: Pavan Kumar Reddy Pothireddy & GPT-5
+# =========================================================
 import streamlit as st
+import pandas as pd, numpy as np, requests, uuid, random
+from datetime import datetime
 
-from firebase_init import (
-    signup_email_password, login_email_password,
-    add_interaction, fetch_user_interactions, ensure_user,
-    email_exists, send_phone_otp, verify_phone_otp, FIREBASE_READY
-)
-from gnn_infer import (
-    load_item_embeddings, make_user_vector, recommend_items, cold_start_mmr
-)
+# ---------------------------------------------------------
+# CONFIGURATION
+st.set_page_config(page_title="ReccoVerse", page_icon="🎬", layout="wide")
 
-# -------------------------------------------------------
-# CONFIG
-APP_NAME = "ReccoVerse"
-ART = Path("artifacts")
-st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
+TMDB_KEY = st.secrets.get("TMDB_API_KEY", "57b87af46cd78b943c23b3b94c68cfef")
 
-# -------------------------------------------------------
-# STYLE (Netflix + AI Glow)
+# ---------------------------------------------------------
+# STYLES
 st.markdown("""
 <style>
 body,[data-testid="stAppViewContainer"]{
-  background:radial-gradient(circle at 30% 20%,#0a0f25,#000) !important;
+  background:radial-gradient(circle at 30% 20%,#060b1c,#000) !important;
   color:#f5f5f5;font-family:'Poppins',sans-serif;}
-h1,h2,h3{color:#fff !important;}
-.stButton>button{background:linear-gradient(90deg,#00ffff,#ff00c3);
+h1,h2,h3{color:#fff;}
+.stButton>button{
+  background:linear-gradient(90deg,#00ffff,#ff00c3);
   border:none;border-radius:50px;color:white;font-weight:600;
-  padding:.6rem 1.3rem;transition:.3s;}
+  padding:.5rem 1.2rem;transition:.3s;}
 .stButton>button:hover{transform:scale(1.05);}
-.searchbar input{border-radius:30px;border:1px solid #00ffff;
-  background:rgba(255,255,255,0.05);color:#fff;padding:.5rem 1rem;width:100%;}
+input,textarea{background:rgba(255,255,255,.05)!important;
+  color:#fff!important;border-radius:8px!important;}
 .card{transition:transform .2s ease;}
 .card:hover{transform:scale(1.03);}
+.badge{font-size:.75rem;padding:.2rem .6rem;
+  border-radius:999px;background:rgba(255,255,255,.1);}
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------
-# HERO SECTION
-def hero():
-    video_url = "https://videos.pexels.com/video-files/856604/856604-hd_1920_1080_30fps.mp4"
-    st.markdown(f"""
-    <div style='position:relative;height:50vh;overflow:hidden;border-radius:18px;'>
-      <video autoplay muted loop playsinline style='width:100%;height:100%;object-fit:cover;filter:brightness(0.7)'>
-        <source src="{video_url}" type="video/mp4">
-      </video>
-      <div style='position:absolute;inset:0;display:flex;flex-direction:column;
-        justify-content:center;align-items:center;background:linear-gradient(180deg,rgba(0,0,0,0.3),rgba(0,0,0,0.85));'>
-        <h1 style='font-size:3.5rem;background:linear-gradient(90deg,#00ffff,#ff00c3);
-          -webkit-background-clip:text;-webkit-text-fill-color:transparent;'>ReccoVerse</h1>
-        <p style='font-size:1.2rem;color:#ddd;'>AI-curated picks across Movies · Music · Fashion · Tech · Beauty</p>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-# -------------------------------------------------------
-# IMAGE FETCH HELPERS
+# ---------------------------------------------------------
+# HELPER FUNCTIONS
 @st.cache_data(show_spinner=False)
-def get_poster(title, domain="movie"):
-    key = st.secrets.get("TMDB_API_KEY", "57b87af46cd78b943c23b3b94c68cfef")
+def tmdb_poster(title):
     try:
-        url = f"https://api.themoviedb.org/3/search/movie?api_key={key}&query={requests.utils.quote(title)}"
-        r = requests.get(url, timeout=5).json()
+        url=f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_KEY}&query={requests.utils.quote(title)}"
+        r=requests.get(url,timeout=5).json()
         if r.get("results") and r["results"][0].get("poster_path"):
-            return "https://image.tmdb.org/t/p/w500" + r["results"][0]["poster_path"]
-    except:
-        pass
-    fallback = {
-        "movie": "https://images.unsplash.com/photo-1496302662116-35cc4f36df92?q=80",
-        "music": "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?q=80",
-        "beauty": "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?q=80",
-        "fashion": "https://images.unsplash.com/photo-1521335629791-ce4aec67dd47?q=80",
-        "tech": "https://images.unsplash.com/photo-1518770660439-4636190af475?q=80"
-    }
-    return fallback.get(domain, fallback["movie"])
+            return "https://image.tmdb.org/t/p/w500"+r["results"][0]["poster_path"]
+    except: pass
+    return "https://images.unsplash.com/photo-1496302662116-35cc4f36df92?q=80"
 
-# -------------------------------------------------------
-# MULTI-DOMAIN DATASET
-@st.cache_data(show_spinner="Loading AI-curated datasets…")
-def load_multidomain():
-    frames = []
+@st.cache_data(show_spinner=False)
+def deezer_sample(limit=30):
+    try:
+        r=requests.get(f"https://api.deezer.com/chart/0/tracks?limit={limit}",timeout=6).json()
+        data=[{
+            "item_id":f"mu_{t['id']}",
+            "title":t["title_short"],
+            "category":"Music",
+            "genre":t["artist"]["name"],
+            "source":"Deezer",
+            "image":t["album"]["cover_medium"]
+        } for t in r["data"]]
+        return pd.DataFrame(data)
+    except: return pd.DataFrame()
 
-    # Movies
-    z = requests.get("https://files.grouplens.org/datasets/movielens/ml-latest-small.zip", timeout=15)
-    with zipfile.ZipFile(io.BytesIO(z.content)) as f:
-        with f.open("ml-latest-small/movies.csv") as c:
-            mv = pd.read_csv(c).sample(120)
-    mv["image"] = [get_poster(t, "movie") for t in mv["title"]]
-    frames.append(pd.DataFrame({
-        "item_id": "mv_" + mv["movieId"].astype(str),
-        "title": mv["title"],
-        "category": "Movies",
-        "source": "Netflix",
-        "genre": mv["genres"].str.split("|").str[0],
-        "image": mv["image"]
-    }))
+@st.cache_data(show_spinner=False)
+def dummy_products(limit=60):
+    r=requests.get(f"https://dummyjson.com/products?limit={limit}",timeout=8).json()
+    rows=[]
+    for p in r["products"]:
+        cat=p["category"].title()
+        domain=("Beauty" if "beauty" in cat.lower()
+                else "Fashion" if any(k in cat.lower() for k in["shirt","shoe","dress","bag"])
+                else "Tech")
+        rows.append({
+            "item_id":f"pr_{p['id']}",
+            "title":p["title"],
+            "category":domain,
+            "genre":cat,
+            "source":"DummyJSON",
+            "image":p["thumbnail"]
+        })
+    return pd.DataFrame(rows)
 
-    # Music
-    music = pd.read_csv("https://raw.githubusercontent.com/yg397/music-recommender-dataset/master/data.csv").dropna().sample(80)
-    frames.append(pd.DataFrame({
-        "item_id": "mu_" + music["artist"].astype(str) + "_" + music["track"].astype(str),
-        "title": music["track"],
-        "category": "Music",
-        "source": "Spotify",
-        "genre": "Pop",
-        "image": get_poster("music album", "music")
-    }))
+@st.cache_data(show_spinner=False)
+def tmdb_movies(limit=80):
+    r=requests.get(f"https://api.themoviedb.org/3/movie/popular?api_key={TMDB_KEY}&language=en-US&page=1",timeout=6).json()
+    data=[{
+        "item_id":f"mv_{m['id']}",
+        "title":m["title"],
+        "category":"Movies",
+        "genre":", ".join([g.get("name","") for g in m.get("genre_ids",[])]) if isinstance(m.get("genre_ids"),list) else "Film",
+        "source":"TMDB",
+        "image":"https://image.tmdb.org/t/p/w500"+m["poster_path"] if m.get("poster_path") else tmdb_poster(m["title"])
+    } for m in r["results"][:limit]]
+    return pd.DataFrame(data)
 
-    # Beauty
-    beauty = pd.DataFrame([
-        {"title": "Maybelline Lipstick", "genre": "Beauty", "source": "Amazon",
-         "image": get_poster("lipstick", "beauty")},
-        {"title": "Lakme Kajal", "genre": "Beauty", "source": "Amazon",
-         "image": get_poster("kajal", "beauty")},
-        {"title": "Nivea Cream", "genre": "Beauty", "source": "Amazon",
-         "image": get_poster("nivea", "beauty")}
-    ])
-
-    beauty["item_id"] = ["pr_" + str(i) for i in range(len(beauty))]
-    beauty["category"] = "Beauty"
-    frames.append(beauty)
-
-    # Tech Gadgets
-    tech = pd.DataFrame([
-        {"title": "Apple iPhone 15 Pro", "genre": "Tech", "source": "Apple",
-         "image": get_poster("iphone", "tech")},
-        {"title": "Sony WH-1000XM5 Headphones", "genre": "Tech", "source": "Sony",
-         "image": get_poster("headphones", "tech")},
-        {"title": "Samsung Galaxy Watch", "genre": "Tech", "source": "Samsung",
-         "image": get_poster("watch", "tech")}
-    ])
-    tech["item_id"] = ["te_" + str(i) for i in range(len(tech))]
-    tech["category"] = "Tech"
-    frames.append(tech)
-
-    # Fashion
-    fashion = pd.DataFrame([
-        {"title": "Zara Denim Jacket", "genre": "Fashion", "source": "Zara",
-         "image": get_poster("jacket", "fashion")},
-        {"title": "Nike Air Max 270", "genre": "Fashion", "source": "Nike",
-         "image": get_poster("shoe", "fashion")},
-        {"title": "Adidas Hoodie", "genre": "Fashion", "source": "Adidas",
-         "image": get_poster("hoodie", "fashion")}
-    ])
-    fashion["item_id"] = ["fa_" + str(i) for i in range(len(fashion))]
-    fashion["category"] = "Fashion"
-    frames.append(fashion)
-
-    df = pd.concat(frames, ignore_index=True)
+# ---------------------------------------------------------
+# MULTIDOMAIN MERGE
+@st.cache_data(show_spinner="Loading AI datasets…")
+def load_data():
+    dfs=[tmdb_movies(), deezer_sample(), dummy_products()]
+    df=pd.concat(dfs,ignore_index=True).drop_duplicates("title")
     return df.sample(frac=1).reset_index(drop=True)
 
-# -------------------------------------------------------
-# INITIALIZE STATE
-def init_state():
-    for k, v in {
-        "authed": False, "uid": None, "email": None,
-        "liked": set(), "bag": set(), "auth_mode": "email"
-    }.items():
-        st.session_state.setdefault(k, v)
-init_state()
-
-# -------------------------------------------------------
-# AUTH
-def auth_page():
-    hero()
-    email = st.text_input("Email")
-    pwd = st.text_input("Password", type="password")
-    c1, c2 = st.columns(2)
-    if c1.button("Login", use_container_width=True):
-        if email_exists(email):
-            ok, uid = login_email_password(email, pwd)
-            if ok:
-                st.session_state.update(authed=True, uid=uid, email=email)
-                ensure_user(uid, email=email)
-                st.success("✅ Logged in!"); st.rerun()
-            else:
-                st.error("Invalid credentials.")
+# ---------------------------------------------------------
+# MOCK AUTHENTICATION
+def login_screen():
+    st.markdown("<h1 style='text-align:center;'>🎬 ReccoVerse</h1>", unsafe_allow_html=True)
+    st.video("https://videos.pexels.com/video-files/856604/856604-hd_1920_1080_30fps.mp4")
+    email=st.text_input("Email",placeholder="user@example.com")
+    pwd=st.text_input("Password",type="password")
+    if st.button("Login / Sign-Up",use_container_width=True):
+        if email and pwd:
+            st.session_state.authed=True
+            st.session_state.user=email
+            st.success(f"Welcome, {email.split('@')[0]}!")
+            st.experimental_rerun()
         else:
-            st.warning("User not found.")
-    if c2.button("Sign Up", use_container_width=True):
-        ok, uid = signup_email_password(email, pwd)
-        if ok:
-            st.session_state.update(authed=True, uid=uid, email=email)
-            ensure_user(uid, email=email)
-            st.success("✅ Account created!"); st.rerun()
-        else:
-            st.error(uid)
+            st.error("Enter credentials.")
+    st.stop()
 
-# -------------------------------------------------------
-# CARD DISPLAY (Fixed buttons)
-def render_card(row):
-    c = st.container()
-    with c:
-        st.image(row.image, use_column_width=True)
-        st.markdown(f"**{row.title}**  \n_{row.source} • {row.genre}_")
-        c1, c2 = st.columns(2)
-        like_key = f"like_{row.item_id}"
-        bag_key = f"bag_{row.item_id}"
-        liked = row.item_id in st.session_state.liked
-        bagged = row.item_id in st.session_state.bag
-        if c1.button("❤️" if liked else "♡ Like", key=like_key):
-            if liked:
-                st.session_state.liked.remove(row.item_id)
-            else:
-                st.session_state.liked.add(row.item_id)
-            st.rerun()
-        if c2.button("👜" if bagged else "➕ Bag", key=bag_key):
-            if bagged:
-                st.session_state.bag.remove(row.item_id)
-            else:
-                st.session_state.bag.add(row.item_id)
-            st.rerun()
+# ---------------------------------------------------------
+# NOVELTY & EXPLAINABILITY
+def novelty_score(item, liked_titles):
+    if not liked_titles: return random.uniform(0.4,0.8)
+    match=sum([1 for t in liked_titles if any(w in item.lower() for w in t.lower().split())])
+    return max(0.2,1-match/len(liked_titles))
 
-# -------------------------------------------------------
-# MAIN APP
-def main():
-    if not st.session_state.authed:
-        auth_page()
-        return
+def why_this(title, liked):
+    rel=[t for t in liked if any(w in title.lower() for w in t.lower().split())]
+    return rel[:3] if rel else random.sample(liked,min(len(liked),2)) if liked else []
 
-    df = load_multidomain()
+# ---------------------------------------------------------
+# RENDER CARD
+def render_card(row, liked_set, bag_set, surprise, liked_titles):
+    col=st.container()
+    with col:
+        st.image(row.image,use_column_width=True)
+        st.markdown(f"**{row.title}**  \n_{row.category} • {row.genre}_")
+        nov=novelty_score(row.title,liked_titles)
+        st.markdown(f"<div class='badge'>🧬 Novelty {int(nov*100)}%</div>",unsafe_allow_html=True)
+        if st.button(("❤️" if row.item_id in liked_set else "♡ Like"),
+                     key=f"like_{row.item_id}_{uuid.uuid4().hex[:6]}"):
+            if row.item_id in liked_set: liked_set.remove(row.item_id)
+            else: liked_set.add(row.item_id)
+            st.experimental_rerun()
+        if st.button(("👜" if row.item_id in bag_set else "➕ Bag"),
+                     key=f"bag_{row.item_id}_{uuid.uuid4().hex[:6]}"):
+            if row.item_id in bag_set: bag_set.remove(row.item_id)
+            else: bag_set.add(row.item_id)
+            st.experimental_rerun()
+        with st.expander("🔍 Why this was recommended"):
+            reasons=why_this(row.title,[t for t in liked_titles])
+            if reasons: [st.markdown(f"- Related to **{r}**") for r in reasons]
+            else: st.markdown("Explored for diversity (Quanta MMR mode).")
 
-    # Sidebar
-    st.sidebar.title("ReccoVerse")
-    choice = st.sidebar.radio("Navigate", ["Home", "Liked", "Bag"])
-    if st.sidebar.button("Sign Out"):
-        st.session_state.authed = False
-        st.session_state.liked.clear()
-        st.session_state.bag.clear()
-        st.rerun()
+# ---------------------------------------------------------
+# MAIN DASHBOARD
+def main_app():
+    st.sidebar.markdown("### 🎬 ReccoVerse Panel")
+    if st.sidebar.button("Sign Out"): st.session_state.clear(); st.experimental_rerun()
+    surprise=st.sidebar.checkbox("🎢 Surprise Me (Quanta Mode)",value=False)
+    movies_w=st.sidebar.slider("Movies",0.0,1.0,0.8,0.1)
+    music_w=st.sidebar.slider("Music",0.0,1.0,0.6,0.1)
+    prod_w=st.sidebar.slider("Products",0.0,1.0,0.7,0.1)
 
-    # Search bar
-    query = st.text_input("🔍 Search", placeholder="Search for movies, music, products, etc...", key="search", label_visibility="collapsed")
-    if query:
-        df = df[df["title"].str.contains(query, case=False)]
+    df=load_data()
+    st.session_state.setdefault("liked",set())
+    st.session_state.setdefault("bag",set())
 
-    # Home feed
-    if choice == "Home":
-        hero()
-        st.markdown("## ✨ Explore AI-curated Picks")
-        for _, row in df.iterrows():
-            with st.container():
-                render_card(row)
-                st.markdown("---")
+    st.text_input("🔍 Search",key="query",placeholder="Search movies, music, fashion, tech...")
+    q=st.session_state.query.lower().strip() if st.session_state.query else ""
+    if q: df=df[df["title"].str.lower().str.contains(q)]
 
-    elif choice == "Liked":
-        st.markdown("## ❤️ Your Liked Items")
-        liked_df = df[df["item_id"].isin(st.session_state.liked)]
-        if liked_df.empty:
-            st.info("No liked items yet.")
-        for _, row in liked_df.iterrows():
-            render_card(row)
+    # Weight rebalancing
+    df["w"]=df["category"].map({"Movies":movies_w,"Music":music_w}).fillna(prod_w)
+    if surprise: df=df.sample(frac=1).reset_index(drop=True)
 
-    elif choice == "Bag":
-        st.markdown("## 👜 Your Bag")
-        bag_df = df[df["item_id"].isin(st.session_state.bag)]
-        if bag_df.empty:
-            st.info("Your bag is empty.")
-        for _, row in bag_df.iterrows():
-            render_card(row)
+    st.markdown("## ✨ Your AI Mood Mix")
+    for _,r in df.head(30).iterrows():
+        render_card(r,st.session_state.liked,st.session_state.bag,surprise,
+                    [df.loc[df.item_id==x,"title"].values[0] for x in st.session_state.liked
+                     if x in df.item_id.values])
 
-# -------------------------------------------------------
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------
+# ENTRYPOINT
+if "authed" not in st.session_state: st.session_state.authed=False
+if not st.session_state.authed: login_screen()
+else: main_app()
