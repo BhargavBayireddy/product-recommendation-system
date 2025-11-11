@@ -1,5 +1,5 @@
-# app.py — ReccoVerse Cinematic Multi-Domain Recommender
-import os, io, json, zipfile, gzip, base64, requests
+# app.py — ReccoVerse Cinematic Multi-Domain Recommender (Fixed Version)
+import os, io, json, zipfile, gzip, base64, requests, uuid
 from pathlib import Path
 from typing import List
 import pandas as pd
@@ -21,9 +21,9 @@ CARD_COLS = 5
 
 st.set_page_config(page_title=APP_NAME, page_icon="🎬", layout="wide")
 
-# ================================================
-#  CSS (Neon Glowing + Cinematic Motion Background)
-# ================================================
+# ==========================================================
+#  Neon CSS + Cinematic Motion Background Styling
+# ==========================================================
 st.markdown("""
 <style>
 body, [data-testid="stAppViewContainer"] {
@@ -32,7 +32,7 @@ body, [data-testid="stAppViewContainer"] {
   font-family: 'Poppins', sans-serif;
 }
 
-/* Hero section cinematic */
+/* Hero section */
 .hero-wrap {
   position: relative;
   height: 52vh;
@@ -42,25 +42,28 @@ body, [data-testid="stAppViewContainer"] {
   box-shadow: 0 0 80px rgba(73,187,255,0.15);
 }
 .hero-video {
-  position: absolute;top: 0;left: 0;width: 100%;height: 100%;
-  object-fit: cover;filter: brightness(.75) contrast(1.2) saturate(1.3);
+  position: absolute;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  filter: brightness(.75) contrast(1.2) saturate(1.3);
 }
 .hero-overlay {
-  position: absolute;inset: 0;
+  position: absolute; inset: 0;
   background: linear-gradient(180deg, rgba(0,0,0,0.4) 0%, rgba(0,0,0,0.9) 90%);
-  display: flex;flex-direction: column;justify-content: center;align-items: center;
+  display: flex; flex-direction: column; justify-content: center; align-items: center;
 }
 .brand {
-  font-size: 3.5rem;font-weight: 900;letter-spacing: .05em;
+  font-size: 3.5rem; font-weight: 900; letter-spacing: .05em;
   background: linear-gradient(90deg,#00f2ff,#ff00c3);
-  -webkit-background-clip: text;-webkit-text-fill-color: transparent;
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   text-shadow: 0 0 25px rgba(0,255,255,0.2);
 }
 .tagline {
-  font-size: 1.2rem;opacity: 0.85;margin-top: 0.6rem;color: #d4d4d4;
+  font-size: 1.2rem; opacity: 0.85; margin-top: 0.6rem; color: #d4d4d4;
 }
 
-/* Glowing input boxes */
+/* Inputs */
 input[type="text"], input[type="password"], textarea {
   background: rgba(255,255,255,0.12) !important;
   color: #ffffff !important;
@@ -79,7 +82,7 @@ input::placeholder {
   color: rgba(255,255,255,0.5);
 }
 
-/* Gradient buttons */
+/* Buttons */
 .stButton>button {
   background: linear-gradient(90deg,#00ffff,#ff00c3);
   border: none !important;
@@ -94,7 +97,7 @@ input::placeholder {
   box-shadow: 0 0 18px rgba(0,255,255,0.5);
 }
 
-/* Card hover */
+/* Cards */
 .card {
   border-radius:18px; overflow:hidden; border:1px solid rgba(255,255,255,0.1);
   transition:transform .18s ease, box-shadow .18s ease;
@@ -106,16 +109,16 @@ input::placeholder {
 </style>
 """, unsafe_allow_html=True)
 
-# ================================================
-#  Hero Section (with Cinematic Motion Background)
-# ================================================
+# ==========================================================
+#  Hero Section (video background)
+# ==========================================================
 def hero_with_video():
     local = ART / "hero.mp4"
     if local.exists():
         b64 = base64.b64encode(local.read_bytes()).decode("utf-8")
         src = f"data:video/mp4;base64,{b64}"
     else:
-        # fallback futuristic AI motion
+        # fallback cinematic AI motion
         src = "https://cdn.pixabay.com/vimeo/927530021/ai-neural-17839.mp4?width=1920&hash=ebc8a5e6422"
     st.markdown(f"""
     <div class="hero-wrap">
@@ -129,11 +132,10 @@ def hero_with_video():
     </div>
     """, unsafe_allow_html=True)
 
-# ================================================
-#  Session State Initialization
-# ================================================
+# ==========================================================
+#  Session Initialization
+# ==========================================================
 def init_state():
-    s = st.session_state
     defaults = {
         "authed": False, "uid": None, "email": None,
         "items_df": None, "embeddings": None, "id_to_idx": None,
@@ -141,13 +143,13 @@ def init_state():
         "auth_mode": "email", "otp_sent": False, "otp_phone": ""
     }
     for k, v in defaults.items():
-        s.setdefault(k, v)
+        st.session_state.setdefault(k, v)
 init_state()
 
-# ================================================
-#  Load Multi-Domain Data (Movies + Music + Beauty)
-# ================================================
-@st.cache_data(show_spinner="Fetching Movies • Music • Beauty datasets…")
+# ==========================================================
+#  Multi-Domain Dataset Loader
+# ==========================================================
+@st.cache_data(show_spinner="Loading Movies, Music & Beauty data...")
 def load_multidomain_online():
     frames = []
 
@@ -166,7 +168,7 @@ def load_multidomain_online():
             "text": movies["title"] + " " + movies["genres"]
         }).sample(200))
     except Exception as e:
-        st.warning(f"Movies dataset failed: {e}")
+        st.warning(f"Movies failed: {e}")
 
     # Music
     try:
@@ -180,7 +182,7 @@ def load_multidomain_online():
             "text": music["artist"] + " " + music["track"]
         }))
     except Exception as e:
-        st.warning(f"Music dataset failed: {e}")
+        st.warning(f"Music failed: {e}")
 
     # Beauty Products
     try:
@@ -196,19 +198,20 @@ def load_multidomain_online():
             "text": beauty["title"] + " " + beauty.get("description", "").astype(str)
         }).dropna().sample(200))
     except Exception as e:
-        st.warning(f"Beauty dataset failed: {e}")
+        st.warning(f"Beauty failed: {e}")
 
     df = pd.concat(frames, ignore_index=True)
     df.drop_duplicates("title", inplace=True)
     return df
 
-# ================================================
-#  Authentication Page (Email + Mobile OTP)
-# ================================================
+# ==========================================================
+#  Authentication Page
+# ==========================================================
 def auth_page():
     hero_with_video()
     st.write("")
     left, right = st.columns([1, 1])
+
     with left:
         st.markdown("#### Join with")
         c1, c2 = st.columns(2)
@@ -265,18 +268,24 @@ def auth_page():
                 else:
                     st.error(uid)
 
-# ================================================
-#  Main Pages
-# ================================================
-def render_card(row, liked, bagged, uid):
+# ==========================================================
+#  Recommendation Pages + Rendering
+# ==========================================================
+def render_card(row, liked, bagged, uid, prefix=""):
+    """Render a single item card with unique keys to avoid duplication"""
     st.image(row.image, use_column_width=True)
     st.markdown(f"**{row.title}**  \n_{row.provider} • {row.genre}_")
+
     c1, c2 = st.columns(2)
-    if c1.button("❤️" if liked else "♡ Like", key=f"l{row.item_id}"):
+    like_key = f"{prefix}_like_{row.item_id}_{uuid.uuid4().hex[:6]}"
+    bag_key = f"{prefix}_bag_{row.item_id}_{uuid.uuid4().hex[:6]}"
+
+    if c1.button("❤️" if liked else "♡ Like", key=like_key):
         add_interaction(uid, row.item_id, "like" if not liked else "unlike")
         (st.session_state.liked.add if not liked else st.session_state.liked.discard)(row.item_id)
         st.rerun()
-    if c2.button("👜" if bagged else "➕ Bag", key=f"b{row.item_id}"):
+
+    if c2.button("👜" if bagged else "➕ Bag", key=bag_key):
         add_interaction(uid, row.item_id, "bag" if not bagged else "remove_bag")
         (st.session_state.bag.add if not bagged else st.session_state.bag.discard)(row.item_id)
         st.rerun()
@@ -288,7 +297,17 @@ def section(title, df, ids, uid):
         row = df[df.item_id == iid]
         if not row.empty:
             with cols[i % CARD_COLS]:
-                render_card(row.iloc[0], iid in st.session_state.liked, iid in st.session_state.bag, uid)
+                render_card(row.iloc[0],
+                            iid in st.session_state.liked,
+                            iid in st.session_state.bag,
+                            uid,
+                            prefix=title.replace(" ", "_"))
+
+def ensure_embs():
+    if st.session_state.items_df is None:
+        df = load_multidomain_online()
+        items, embs, idmap, A = load_item_embeddings(df, ART)
+        st.session_state.items_df, st.session_state.embeddings, st.session_state.id_to_idx, st.session_state.A = items, embs, idmap, A
 
 def home(uid):
     st.markdown(f"## Welcome to {APP_NAME}")
@@ -309,12 +328,6 @@ def home(uid):
     section("Explore Something Different", df, cold, uid)
     st.autorefresh(interval=REFRESH_MS)
 
-def ensure_embs():
-    if st.session_state.items_df is None:
-        df = load_multidomain_online()
-        items, embs, idmap, A = load_item_embeddings(df, ART)
-        st.session_state.items_df, st.session_state.embeddings, st.session_state.id_to_idx, st.session_state.A = items, embs, idmap, A
-
 def navbar():
     st.sidebar.markdown("### ReccoVerse")
     page = st.sidebar.radio("Navigate", ["Home", "Liked", "Bag"])
@@ -327,17 +340,21 @@ def navbar():
         st.rerun()
     return page
 
-# ================================================
-#  App Runner
-# ================================================
+# ==========================================================
+#  Main Entry
+# ==========================================================
 def main():
     if not st.session_state.authed:
         auth_page()
     else:
         p = navbar()
         uid = st.session_state.uid
-        {"Home": home, "Liked": lambda u: section("Liked", st.session_state.items_df, list(st.session_state.liked), u),
-         "Bag": lambda u: section("Bag", st.session_state.items_df, list(st.session_state.bag), u)}[p](uid)
+        if p == "Home":
+            home(uid)
+        elif p == "Liked":
+            section("Liked Items", st.session_state.items_df, list(st.session_state.liked), uid)
+        else:
+            section("Your Bag", st.session_state.items_df, list(st.session_state.bag), uid)
 
 if __name__ == "__main__":
     main()
