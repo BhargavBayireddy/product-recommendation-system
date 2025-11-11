@@ -1,3 +1,31 @@
+# firebase_init.py — Firebase + (optional) Twilio OTP + robust local mock
+# Requires: pyrebase4, firebase-admin, google-cloud-firestore (for Firebase path)
+# Optional (for real SMS): twilio
+#
+# Put these in .streamlit/secrets.toml (Firebase: optional; Twilio: optional)
+#
+# [FIREBASE_WEB_CONFIG]
+# apiKey = "..."
+# authDomain = "..."
+# projectId = "..."
+# storageBucket = "..."
+# messagingSenderId = "..."
+# appId = "..."
+#
+# [FIREBASE_SERVICE_ACCOUNT]
+# type = "service_account"
+# project_id = "..."
+# private_key_id = "..."
+# private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+# client_email = "firebase-adminsdk-...@<project>.iam.gserviceaccount.com"
+# client_id = "..."
+# token_uri = "https://oauth2.googleapis.com/token"
+#
+# [TWILIO]
+# ACCOUNT_SID = "ACxxxxxxxx..."
+# AUTH_TOKEN = "xxxxxxxx"
+# FROM = "+1xxxxxxxxxx"
+
 from typing import Tuple, Dict, List, Optional
 import time, random, string
 import streamlit as st
